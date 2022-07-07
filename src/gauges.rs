@@ -25,6 +25,8 @@ use time::{Duration, OffsetDateTime};
 pub const STATUS_LABEL: &str = "status";
 /// Label used for public key
 pub const PUBKEY_LABEL: &str = "pubkey";
+/// Label used for peoch
+pub const EPOCH_LABEL: &str = "epoch";
 
 pub struct PrometheusGauges {
     pub active_validators: IntGaugeVec,
@@ -32,6 +34,7 @@ pub struct PrometheusGauges {
     pub activated_stake: IntGaugeVec,
     pub last_vote: IntGaugeVec,
     pub root_slot: IntGaugeVec,
+    pub vote_credits: IntGaugeVec,
     pub transaction_count: IntGauge,
     pub slot_height: IntGauge,
     pub current_epoch: IntGauge,
@@ -87,6 +90,12 @@ impl PrometheusGauges {
                 "solana_validator_root_slot",
                 "The root slot of a validator",
                 &[PUBKEY_LABEL]
+            )
+            .unwrap(),
+            vote_credits: register_int_gauge_vec!(
+                "solana_vote_credits",
+                "Vote credits per validator",
+                &[PUBKEY_LABEL, EPOCH_LABEL]
             )
             .unwrap(),
             transaction_count: register_int_gauge!(
@@ -233,6 +242,7 @@ impl PrometheusGauges {
             .chain(vote_accounts.delinquent.iter())
             .filter(|rpc| self.vote_accounts_whitelist.contains(&rpc.vote_pubkey))
         {
+           
             self.activated_stake
                 .get_metric_with_label_values(&[&*v.vote_pubkey])
                 .map(|m| m.set(v.activated_stake as i64))?;
@@ -245,6 +255,13 @@ impl PrometheusGauges {
             self.staking_commission
                 .get_metric_with_label_values(&[&*v.vote_pubkey])
                 .map(|m| m.set(v.commission as i64))?;
+
+            for (epoch, current_epoch_credits, _) in &v.epoch_credits {
+                self.vote_credits
+                    .get_metric_with_label_values(&[&*v.vote_pubkey, &*epoch.to_string()])
+                    .map(|m| m.set(*current_epoch_credits as i64))?;
+            }
+ 
         }
 
         Ok(())
