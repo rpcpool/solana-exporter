@@ -25,6 +25,8 @@ use time::{Duration, OffsetDateTime};
 pub const STATUS_LABEL: &str = "status";
 /// Label used for public key
 pub const PUBKEY_LABEL: &str = "pubkey";
+/// Label used for public key
+pub const IDENTITY_LABEL: &str = "identity";
 /// Label used for peoch
 pub const EPOCH_LABEL: &str = "epoch";
 
@@ -34,7 +36,9 @@ pub struct PrometheusGauges {
     pub activated_stake: IntGaugeVec,
     pub last_vote: IntGaugeVec,
     pub root_slot: IntGaugeVec,
+    pub epoch_vote_account: IntGaugeVec,
     pub vote_credits: IntGaugeVec,
+    pub identity: GaugeVec,
     pub transaction_count: IntGauge,
     pub slot_height: IntGauge,
     pub current_epoch: IntGauge,
@@ -92,10 +96,22 @@ impl PrometheusGauges {
                 &[PUBKEY_LABEL]
             )
             .unwrap(),
+            identity: register_gauge_vec!(
+                "solana_validator_identity",
+                "The identity of the validator",
+                &[PUBKEY_LABEL, IDENTITY_LABEL]
+            )
+            .unwrap(),
             vote_credits: register_int_gauge_vec!(
                 "solana_vote_credits",
                 "Vote credits per validator",
                 &[PUBKEY_LABEL, EPOCH_LABEL]
+            )
+            .unwrap(),
+            epoch_vote_account: register_int_gauge_vec!(
+                "solana_epoch_vote_account",
+                "Staked for this epoch or not",
+                &[PUBKEY_LABEL]
             )
             .unwrap(),
             transaction_count: register_int_gauge!(
@@ -255,6 +271,12 @@ impl PrometheusGauges {
             self.staking_commission
                 .get_metric_with_label_values(&[&*v.vote_pubkey])
                 .map(|m| m.set(v.commission as i64))?;
+            self.identity
+                .get_metric_with_label_values(&[&*v.vote_pubkey, &*v.node_pubkey])
+                .map(|m| m.set(1.))?;
+            self.epoch_vote_account
+                .get_metric_with_label_values(&[&*v.vote_pubkey])
+                .map(|m| m.set(v.epoch_vote_account as i64))?;
 
             for (epoch, current_epoch_credits, _) in &v.epoch_credits {
                 self.vote_credits
