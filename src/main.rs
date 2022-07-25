@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
                 maxmind: Some(MaxMindAPIKey::new("username", "password")),
                 vote_account_whitelist: Some(Whitelist::default()),
                 staking_account_whitelist: Some(Whitelist::default()),
+                enable_rewards: Some(true),
             };
 
             let location = sc
@@ -144,19 +145,21 @@ and then put real values there.",
 
     let vote_accounts_whitelist = config.vote_account_whitelist.unwrap_or_default();
     let staking_account_whitelist = config.staking_account_whitelist.unwrap_or_default();
+    let enable_rewards = config.enable_rewards.unwrap_or(true);
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
     let mut skipped_slots_monitor =
         SkippedSlotsMonitor::new(&client, &gauges.leader_slots, &gauges.skipped_slot_percent);
-    let mut rewards_monitor = RewardsMonitor::new(
-        &client,
-        &gauges.current_staking_apy,
-        &gauges.average_staking_apy,
-        &gauges.validator_rewards,
-        &rewards_cache,
-        &staking_account_whitelist,
-        &vote_accounts_whitelist,
-    );
+    let rewards_monitor = if enable_rewards {
+        Some(RewardsMonitor::new(
+            &client,
+            &gauges.current_staking_apy,
+            &gauges.average_staking_apy,
+            &gauges.validator_rewards,
+            &rewards_cache,
+            &staking_account_whitelist,
+            &vote_accounts_whitelist,
+        ) ) } else { None };
 
     loop {
         let _guard = exporter.wait_duration(duration);
@@ -191,8 +194,10 @@ and then put real values there.",
         skipped_slots_monitor
             .export_skipped_slots(&epoch_info, &node_whitelist)
             .context("Failed to export skipped slots")?;
-        rewards_monitor
-            .export_rewards(&epoch_info)
-            .context("Failed to export rewards")?;
+
+        if let Some(x) = &rewards_monitor {
+            x.export_rewards(&epoch_info)
+                .context("Failed to export rewards")?;
+        } 
     }
 }

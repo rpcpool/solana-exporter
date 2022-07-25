@@ -26,4 +26,6 @@ pub struct ExporterConfig {
     pub staking_account_whitelist: Option<Whitelist>,
     /// Maxmind API username and password.
     pub maxmind: Option<MaxMindAPIKey>,
+    /// Whjether to process rewards data or not
+    pub enable_rewards: Option<bool>,
 }

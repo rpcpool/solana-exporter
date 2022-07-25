@@ -106,7 +106,7 @@ impl<'a> RewardsMonitor<'a> {
     }
 
     /// Exports reward metrics. APY values will not be re-calculated more than once an epoch.
-    pub fn export_rewards(&mut self, epoch_info: &EpochInfo) -> anyhow::Result<()> {
+    pub fn export_rewards(&self, epoch_info: &EpochInfo) -> anyhow::Result<()> {
         let epoch = epoch_info.epoch;
 
         // Possible that rewards haven't shown up yet for this epoch
