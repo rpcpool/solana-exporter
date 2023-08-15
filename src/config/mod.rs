@@ -28,4 +28,6 @@ pub struct ExporterConfig {
     pub maxmind: Option<MaxMindAPIKey>,
     /// Whjether to process rewards data or not
     pub enable_rewards: Option<bool>,
+    /// Whjether to process skipped slots data or not
+    pub enable_skipped_slots: Option<bool>,
 }

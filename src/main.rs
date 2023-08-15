@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
                 vote_account_whitelist: Some(Whitelist::default()),
                 staking_account_whitelist: Some(Whitelist::default()),
                 enable_rewards: Some(true),
+                enable_skipped_slots: Some(true),
             };
 
             let location = sc
@@ -146,10 +147,13 @@ and then put real values there.",
     let vote_accounts_whitelist = config.vote_account_whitelist.unwrap_or_default();
     let staking_account_whitelist = config.staking_account_whitelist.unwrap_or_default();
     let enable_rewards = config.enable_rewards.unwrap_or(true);
+    let enable_skipped_slots = config.enable_skipped_slots.unwrap_or(true);
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
-    let mut skipped_slots_monitor =
-        SkippedSlotsMonitor::new(&client, &gauges.leader_slots, &gauges.skipped_slot_percent);
+    let mut skipped_slots_monitor = if enable_skipped_slots {
+        Some(SkippedSlotsMonitor::new(&client, &gauges.leader_slots, &gauges.skipped_slot_percent))
+    } else { None };
+
     let rewards_monitor = if enable_rewards {
         Some(RewardsMonitor::new(
             &client,
@@ -191,9 +195,11 @@ and then put real values there.",
                 .await
                 .context("Failed to export IP address info metrics")?;
         }
-        skipped_slots_monitor
-            .export_skipped_slots(&epoch_info, &node_whitelist)
-            .context("Failed to export skipped slots")?;
+
+        if enable_skipped_slots {
+            skipped_slots_monitor.as_mut().unwrap().export_skipped_slots(&epoch_info, &node_whitelist)
+              .context("Failed to export skipped slots")?;
+        }
 
         if let Some(x) = &rewards_monitor {
             x.export_rewards(&epoch_info)
