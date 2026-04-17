@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+
+version: 2
+
+builds:
+  - id: solana-exporter
+    builder: rust
+    binary: solana-exporter
+    targets:
+      - x86_64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+
+archives:
+  - id: solana-exporter
+    name_template: solana-exporter-linux-amd64
+    formats: [binary]
+    ids:
+      - solana-exporter
+
+release:
+  disable: "{{ .Prerelease }}"
+  header: |
+    rust {{ .Env.RUST_VERSION }}
+
+changelog:
+  sort: asc
+  use: github
