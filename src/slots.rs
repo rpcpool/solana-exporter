@@ -4,7 +4,7 @@ use crate::config::Whitelist;
 use log::{debug, log_enabled, Level};
 use prometheus_exporter::prometheus::{GaugeVec, IntCounterVec};
 use solana_client::{client_error::ClientError, rpc_client::RpcClient};
-use solana_sdk::epoch_info::EpochInfo;
+use solana_epoch_info::EpochInfo;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
@@ -161,7 +161,7 @@ impl<'a> SkippedSlotsMonitor<'a> {
             let skipped_percent = (skipped_count as f64 / total_count as f64) * 100.0;
             self.skipped_slot_percent
                 .get_metric_with_label_values(&[leader])
-                .map(|c| c.set(skipped_percent as f64))?;
+                .map(|c| c.set(skipped_percent))?;
         }
 
         self.slot_index = epoch_info.slot_index;

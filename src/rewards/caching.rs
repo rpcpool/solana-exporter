@@ -1,9 +1,9 @@
 use crate::rewards::VoterApy;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use solana_sdk::clock::Epoch;
-use solana_sdk::pubkey::Pubkey;
-use solana_transaction_status::{Reward, Rewards};
+use solana_clock::Epoch;
+use solana_pubkey::Pubkey;
+use solana_transaction_status_client_types::{Reward, Rewards};
 use std::collections::HashMap;
 
 pub type PubkeyVoterApyMapping = HashMap<Pubkey, (Pubkey, f64)>;
