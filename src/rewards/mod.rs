@@ -5,13 +5,17 @@ use anyhow::anyhow;
 use log::debug;
 use prometheus_exporter::prometheus::{GaugeVec, IntGaugeVec};
 use serde::{Deserialize, Serialize};
+use solana_account::Account;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
-use solana_runtime::bank::RewardType;
-use solana_sdk::account::Account;
-use solana_sdk::{clock::Epoch, epoch_info::EpochInfo, pubkey::Pubkey};
-use solana_stake_program::stake_state::StakeState;
-use solana_transaction_status::{Reward, Rewards, TransactionDetails, UiTransactionEncoding};
+use solana_clock::Epoch;
+use solana_epoch_info::EpochInfo;
+use solana_pubkey::Pubkey;
+use solana_reward_info::RewardType;
+use solana_stake_interface::state::StakeStateV2;
+use solana_transaction_status_client_types::{
+    Reward, Rewards, TransactionDetails, UiTransactionEncoding,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::u64;
 use time::OffsetDateTime;
@@ -401,6 +405,7 @@ impl<'a> RewardsMonitor<'a> {
                                 transaction_details: Some(TransactionDetails::None),
                                 rewards: Some(false),
                                 commitment: None,
+                                max_supported_transaction_version: Some(0),
                             },
                         )?;
                         Ok(ui_confirmed_block.block_time)
@@ -452,7 +457,7 @@ fn calculate_staking_apy(
     lamports: u64,
     post_balance: u64,
 ) -> anyhow::Result<Option<StakingApy>> {
-    let stake_state: StakeState = bincode::deserialize(&account_info.data)?;
+    let stake_state: StakeStateV2 = bincode::deserialize(&account_info.data)?;
     if let Some(delegation) = stake_state.delegation() {
         let percent = if !seen_voters.contains(&delegation.voter_pubkey) && lamports > 0 {
             let prev_balance = post_balance - lamports;

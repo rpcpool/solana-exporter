@@ -1,6 +1,6 @@
 use crate::config::Whitelist;
 use solana_client::{rpc_client::RpcClient, rpc_response::RpcVoteAccountStatus};
-use solana_sdk::clock::Epoch;
+use solana_clock::Epoch;
 
 /// Applies `f` to the first block in `epoch`.
 pub fn with_first_block<F, A>(client: &RpcClient, epoch: Epoch, f: F) -> anyhow::Result<Option<A>>

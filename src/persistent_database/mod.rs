@@ -21,10 +21,11 @@ pub struct PersistentDatabase {
 impl PersistentDatabase {
     /// Creates/opens a new persistent database in the path provided.
     pub fn new(dir: &Path) -> anyhow::Result<Self> {
-        let database = sled::Config::default()
-            .path(dir)
-            .use_compression(true)
-            .open()?;
+        // Note: sled's `compression` feature is disabled because it links zstd
+        // 0.9, which conflicts with the zstd 0.13 that solana 4.x links (cargo
+        // forbids two packages linking the same native lib). The cache is small,
+        // so storing it uncompressed is fine.
+        let database = sled::Config::default().path(dir).open()?;
         let metadata = Metadata::new(database.open_tree("metadata")?)
             .context("could not read metadata from database")?;
 

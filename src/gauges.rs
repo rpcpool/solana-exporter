@@ -16,8 +16,8 @@ use prometheus_exporter::prometheus::{
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
 use solana_client::rpc_response::{RpcContactInfo, RpcVoteAccountInfo, RpcVoteAccountStatus};
-use solana_sdk::epoch_info::EpochInfo;
-use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
+use solana_epoch_info::EpochInfo;
+use solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding};
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 
@@ -258,7 +258,6 @@ impl PrometheusGauges {
             .chain(vote_accounts.delinquent.iter())
             .filter(|rpc| self.vote_accounts_whitelist.contains(&rpc.vote_pubkey))
         {
-           
             self.activated_stake
                 .get_metric_with_label_values(&[&*v.vote_pubkey])
                 .map(|m| m.set(v.activated_stake as i64))?;
@@ -283,7 +282,6 @@ impl PrometheusGauges {
                     .get_metric_with_label_values(&[&*v.vote_pubkey, &*epoch.to_string()])
                     .map(|m| m.set(*current_epoch_credits as i64))?;
             }
- 
         }
 
         Ok(())
@@ -315,6 +313,7 @@ impl PrometheusGauges {
                             transaction_details: Some(TransactionDetails::None),
                             rewards: Some(false),
                             commitment: None,
+                            max_supported_transaction_version: Some(0),
                         },
                     )?
                     .block_time

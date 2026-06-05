@@ -4,7 +4,7 @@ use crate::config::Whitelist;
 use log::{debug, log_enabled, Level};
 use prometheus_exporter::prometheus::{GaugeVec, IntCounterVec};
 use solana_client::{client_error::ClientError, rpc_client::RpcClient};
-use solana_sdk::epoch_info::EpochInfo;
+use solana_epoch_info::EpochInfo;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
