@@ -1,6 +1,7 @@
 //! Statistics of skipped and validated slots.
 
 use crate::config::Whitelist;
+use crate::rpc_extra::get_blocks;
 use log::{debug, log_enabled, Level};
 use prometheus_exporter::prometheus::{GaugeVec, IntCounterVec};
 use solana_client::{client_error::ClientError, rpc_client::RpcClient};
@@ -104,10 +105,11 @@ impl<'a> SkippedSlotsMonitor<'a> {
                 "Getting confirmed blocks from {} to {}",
                 abs_range_step, abs_range_step_end
             );
-            confirmed_blocks.extend(
-                self.client
-                    .get_blocks(abs_range_step, Some(abs_range_step_end))?,
-            );
+            confirmed_blocks.extend(get_blocks(
+                self.client,
+                abs_range_step,
+                Some(abs_range_step_end),
+            )?);
         }
         confirmed_blocks.sort_unstable();
         debug!(

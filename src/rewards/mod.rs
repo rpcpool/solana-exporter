@@ -1,6 +1,6 @@
 use crate::config::Whitelist;
 use crate::rewards::caching::{PubkeyVoterApyMapping, RewardsCache};
-use crate::rpc_extra::with_first_block;
+use crate::rpc_extra::{get_block, get_block_with_config, with_first_block};
 use anyhow::anyhow;
 use log::debug;
 use prometheus_exporter::prometheus::{GaugeVec, IntGaugeVec};
@@ -375,7 +375,7 @@ impl<'a> RewardsMonitor<'a> {
         // If it's the current epoch then we must extrapolate
         if epoch == epoch_info.epoch {
             let first_slot = epoch_info.absolute_slot - epoch_info.slot_index;
-            return if let Some(first_slot_time) = self.client.get_block(first_slot)?.block_time {
+            return if let Some(first_slot_time) = get_block(self.client, first_slot)?.block_time {
                 let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
                     - first_slot_time) as f64
                     / (epoch_info.slot_index) as f64;
@@ -394,7 +394,8 @@ impl<'a> RewardsMonitor<'a> {
             let days_in_epoch = {
                 let first_block_timestamp = |ep| {
                     with_first_block(self.client, ep, |block| {
-                        let ui_confirmed_block = self.client.get_block_with_config(
+                        let ui_confirmed_block = get_block_with_config(
+                            self.client,
                             block,
                             RpcBlockConfig {
                                 encoding: Some(UiTransactionEncoding::Base64),
@@ -434,7 +435,7 @@ impl<'a> RewardsMonitor<'a> {
             Ok(Some(rewards))
         } else {
             with_first_block(self.client, epoch, |block| {
-                let rewards = self.client.get_block(block)?.rewards;
+                let rewards = get_block(self.client, block)?.rewards;
                 self.cache.add_epoch_rewards(epoch, &rewards)?;
                 Ok(Some(rewards))
             })

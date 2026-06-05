@@ -33,6 +33,7 @@ dirs = "^3.0.2"
 semver = "^1.0.0"
 toml = "^0.5.8"
 solana-transaction-status = "^1.7.3"
+serde_json = "1.0.150"
 
 [dependencies.console]
 version = "0.16.0"

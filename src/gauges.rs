@@ -4,7 +4,7 @@ use crate::geolocation::api::MAXMIND_CITY_URI;
 use crate::geolocation::caching::GeolocationCache;
 use crate::geolocation::get_rpc_contact_ip;
 use crate::geolocation::identifier::DatacenterIdentifier;
-use crate::rpc_extra::with_first_block;
+use crate::rpc_extra::{get_block_with_config, with_first_block};
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
 use geoip2_city::CityApiResponse;
@@ -307,8 +307,8 @@ impl PrometheusGauges {
 
         with_first_block(client, epoch_info.epoch, |block| {
             let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
-                - client
-                    .get_block_with_config(
+                - get_block_with_config(
+                        client,
                         block,
                         RpcBlockConfig {
                             encoding: Some(UiTransactionEncoding::Base64),
