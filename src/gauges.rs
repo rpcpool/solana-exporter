@@ -258,7 +258,6 @@ impl PrometheusGauges {
             .chain(vote_accounts.delinquent.iter())
             .filter(|rpc| self.vote_accounts_whitelist.contains(&rpc.vote_pubkey))
         {
-           
             self.activated_stake
                 .get_metric_with_label_values(&[&*v.vote_pubkey])
                 .map(|m| m.set(v.activated_stake as i64))?;
@@ -283,7 +282,6 @@ impl PrometheusGauges {
                     .get_metric_with_label_values(&[&*v.vote_pubkey, &*epoch.to_string()])
                     .map(|m| m.set(*current_epoch_credits as i64))?;
             }
- 
         }
 
         Ok(())
@@ -308,17 +306,17 @@ impl PrometheusGauges {
         with_first_block(client, epoch_info.epoch, |block| {
             let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
                 - get_block_with_config(
-                        client,
-                        block,
-                        RpcBlockConfig {
-                            encoding: Some(UiTransactionEncoding::Base64),
-                            transaction_details: Some(TransactionDetails::None),
-                            rewards: Some(false),
-                            commitment: None,
-                        },
-                    )?
-                    .block_time
-                    .unwrap()) as f64
+                    client,
+                    block,
+                    RpcBlockConfig {
+                        encoding: Some(UiTransactionEncoding::Base64),
+                        transaction_details: Some(TransactionDetails::None),
+                        rewards: Some(false),
+                        commitment: None,
+                    },
+                )?
+                .block_time
+                .unwrap()) as f64
                 / (epoch_info.slot_index) as f64;
             self.average_slot_time.set(average_slot_time);
             Ok(Some(()))

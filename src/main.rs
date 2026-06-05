@@ -151,8 +151,14 @@ and then put real values there.",
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
     let mut skipped_slots_monitor = if enable_skipped_slots {
-        Some(SkippedSlotsMonitor::new(&client, &gauges.leader_slots, &gauges.skipped_slot_percent))
-    } else { None };
+        Some(SkippedSlotsMonitor::new(
+            &client,
+            &gauges.leader_slots,
+            &gauges.skipped_slot_percent,
+        ))
+    } else {
+        None
+    };
 
     let rewards_monitor = if enable_rewards {
         Some(RewardsMonitor::new(
@@ -163,7 +169,10 @@ and then put real values there.",
             &rewards_cache,
             &staking_account_whitelist,
             &vote_accounts_whitelist,
-        ) ) } else { None };
+        ))
+    } else {
+        None
+    };
 
     loop {
         let _guard = exporter.wait_duration(duration);
@@ -197,13 +206,16 @@ and then put real values there.",
         }
 
         if enable_skipped_slots {
-            skipped_slots_monitor.as_mut().unwrap().export_skipped_slots(&epoch_info, &node_whitelist)
-              .context("Failed to export skipped slots")?;
+            skipped_slots_monitor
+                .as_mut()
+                .unwrap()
+                .export_skipped_slots(&epoch_info, &node_whitelist)
+                .context("Failed to export skipped slots")?;
         }
 
         if let Some(x) = &rewards_monitor {
             x.export_rewards(&epoch_info)
                 .context("Failed to export rewards")?;
-        } 
+        }
     }
 }
