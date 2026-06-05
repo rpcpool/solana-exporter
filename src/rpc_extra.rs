@@ -11,7 +11,10 @@ where
     let first_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
 
     // First block in `epoch`.
-    let first_block = client.get_blocks_with_limit(first_slot, 1)?.get(0).cloned();
+    let first_block = client
+        .get_blocks_with_limit(first_slot, 1)?
+        .first()
+        .cloned();
 
     if let Some(block) = first_block {
         f(block)

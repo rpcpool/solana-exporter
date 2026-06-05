@@ -161,7 +161,7 @@ impl<'a> SkippedSlotsMonitor<'a> {
             let skipped_percent = (skipped_count as f64 / total_count as f64) * 100.0;
             self.skipped_slot_percent
                 .get_metric_with_label_values(&[leader])
-                .map(|c| c.set(skipped_percent as f64))?;
+                .map(|c| c.set(skipped_percent))?;
         }
 
         self.slot_index = epoch_info.slot_index;

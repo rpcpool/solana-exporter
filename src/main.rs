@@ -46,6 +46,11 @@ pub const EXPORTER_DATA_DIR: &str = ".solana-exporter";
 /// Current version of `solana-exporter`
 pub const SOLANA_EXPORTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// The metric-update guard returned by `exporter.wait_duration` is intentionally
+// held across the async MaxMind queries in the update loop, so a concurrent
+// `/metrics` scrape blocks until a full, consistent update is published rather
+// than observing a half-updated set. See the loop body for details.
+#[allow(clippy::await_holding_lock)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -54,40 +59,36 @@ async fn main() -> anyhow::Result<()> {
     let cli_configs = App::from_yaml(yaml).get_matches();
 
     // Subcommands
-    match cli_configs.subcommand() {
-        ("generate", Some(sc)) => {
-            let template_config = ExporterConfig {
-                rpc: "http://localhost:8899".to_string(),
-                target: SocketAddr::new("0.0.0.0".parse()?, 9179),
-                maxmind: Some(MaxMindAPIKey::new("username", "password")),
-                vote_account_whitelist: Some(Whitelist::default()),
-                staking_account_whitelist: Some(Whitelist::default()),
-                enable_rewards: Some(true),
-                enable_skipped_slots: Some(true),
-            };
+    if let ("generate", Some(sc)) = cli_configs.subcommand() {
+        let template_config = ExporterConfig {
+            rpc: "http://localhost:8899".to_string(),
+            target: SocketAddr::new("0.0.0.0".parse()?, 9179),
+            maxmind: Some(MaxMindAPIKey::new("username", "password")),
+            vote_account_whitelist: Some(Whitelist::default()),
+            staking_account_whitelist: Some(Whitelist::default()),
+            enable_rewards: Some(true),
+            enable_skipped_slots: Some(true),
+        };
 
-            let location = sc
-                .value_of("output")
-                .map(|s| Path::new(s).to_path_buf())
-                .unwrap_or_else(|| {
-                    dirs::home_dir()
-                        .unwrap()
-                        .join(EXPORTER_DATA_DIR)
-                        .join(CONFIG_FILE_NAME)
-                });
+        let location = sc
+            .value_of("output")
+            .map(|s| Path::new(s).to_path_buf())
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap()
+                    .join(EXPORTER_DATA_DIR)
+                    .join(CONFIG_FILE_NAME)
+            });
 
-            // Only attempt to create .solana-exporter, if user specified location then don't try
-            // to create directories
-            if sc.value_of("output").is_none() {
-                create_dir_all(&location.parent().unwrap())?;
-            }
-
-            let mut file = File::create(location)?;
-            file.write_all(toml::to_string_pretty(&template_config)?.as_ref())?;
-            std::process::exit(0);
+        // Only attempt to create .solana-exporter, if user specified location then don't try
+        // to create directories
+        if sc.value_of("output").is_none() {
+            create_dir_all(location.parent().unwrap())?;
         }
 
-        (_, _) => {}
+        let mut file = File::create(location)?;
+        file.write_all(toml::to_string_pretty(&template_config)?.as_ref())?;
+        std::process::exit(0);
     }
 
     let persistent_database = {
@@ -151,8 +152,14 @@ and then put real values there.",
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
     let mut skipped_slots_monitor = if enable_skipped_slots {
-        Some(SkippedSlotsMonitor::new(&client, &gauges.leader_slots, &gauges.skipped_slot_percent))
-    } else { None };
+        Some(SkippedSlotsMonitor::new(
+            &client,
+            &gauges.leader_slots,
+            &gauges.skipped_slot_percent,
+        ))
+    } else {
+        None
+    };
 
     let rewards_monitor = if enable_rewards {
         Some(RewardsMonitor::new(
@@ -163,9 +170,15 @@ and then put real values there.",
             &rewards_cache,
             &staking_account_whitelist,
             &vote_accounts_whitelist,
-        ) ) } else { None };
+        ))
+    } else {
+        None
+    };
 
     loop {
+        // Held for the entire update cycle (including the async MaxMind queries)
+        // so a concurrent `/metrics` scrape waits for a complete, consistent
+        // update. See the `#[allow(clippy::await_holding_lock)]` on `main`.
         let _guard = exporter.wait_duration(duration);
         debug!("Updating metrics");
 
@@ -197,13 +210,16 @@ and then put real values there.",
         }
 
         if enable_skipped_slots {
-            skipped_slots_monitor.as_mut().unwrap().export_skipped_slots(&epoch_info, &node_whitelist)
-              .context("Failed to export skipped slots")?;
+            skipped_slots_monitor
+                .as_mut()
+                .unwrap()
+                .export_skipped_slots(&epoch_info, &node_whitelist)
+                .context("Failed to export skipped slots")?;
         }
 
         if let Some(x) = &rewards_monitor {
             x.export_rewards(&epoch_info)
                 .context("Failed to export rewards")?;
-        } 
+        }
     }
 }

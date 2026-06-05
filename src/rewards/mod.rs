@@ -17,7 +17,6 @@ use solana_transaction_status_client_types::{
     Reward, Rewards, TransactionDetails, UiTransactionEncoding,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::u64;
 use time::OffsetDateTime;
 
 pub mod caching;
