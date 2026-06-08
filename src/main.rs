@@ -184,7 +184,7 @@ and then put real values there.",
 
         // Get metrics we need
         let epoch_info = client.get_epoch_info()?;
-        let nodes = client.get_cluster_nodes()?;
+        let nodes = rpc_extra::get_cluster_nodes_lenient(&client)?;
         let vote_accounts = client.get_vote_accounts()?;
         let node_whitelist = rpc_extra::node_pubkeys(&vote_accounts_whitelist, &vote_accounts);
 
