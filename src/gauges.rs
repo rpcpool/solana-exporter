@@ -4,7 +4,7 @@ use crate::geolocation::api::MAXMIND_CITY_URI;
 use crate::geolocation::caching::GeolocationCache;
 use crate::geolocation::get_rpc_contact_ip;
 use crate::geolocation::identifier::DatacenterIdentifier;
-use crate::rpc_extra::with_first_block;
+use crate::rpc_extra::first_block_in_epoch;
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
 use geoip2_city::CityApiResponse;
@@ -13,7 +13,7 @@ use prometheus_exporter::prometheus::{
     register_gauge, register_gauge_vec, register_int_counter_vec, register_int_gauge,
     register_int_gauge_vec, Gauge, GaugeVec, IntCounterVec, IntGauge, IntGaugeVec,
 };
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
 use solana_client::rpc_response::{RpcContactInfo, RpcVoteAccountInfo, RpcVoteAccountStatus};
 use solana_epoch_info::EpochInfo;
@@ -288,7 +288,7 @@ impl PrometheusGauges {
     }
 
     /// Exports gauges for epoch
-    pub fn export_epoch_info(
+    pub async fn export_epoch_info(
         &self,
         epoch_info: &EpochInfo,
         client: &RpcClient,
@@ -303,7 +303,7 @@ impl PrometheusGauges {
         self.current_epoch_first_slot.set(first_slot as i64);
         self.current_epoch_last_slot.set(last_slot as i64);
 
-        with_first_block(client, epoch_info.epoch, |block| {
+        if let Some(block) = first_block_in_epoch(client, epoch_info.epoch).await? {
             let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
                 - client
                     .get_block_with_config(
@@ -315,19 +315,19 @@ impl PrometheusGauges {
                             commitment: None,
                             max_supported_transaction_version: Some(0),
                         },
-                    )?
+                    )
+                    .await?
                     .block_time
                     .unwrap()) as f64
                 / (epoch_info.slot_index) as f64;
             self.average_slot_time.set(average_slot_time);
-            Ok(Some(()))
-        })?;
+        }
 
         Ok(())
     }
 
     /// Exports information about nodes
-    pub fn export_nodes_info(
+    pub async fn export_nodes_info(
         &self,
         nodes: &[RpcContactInfo],
         client: &RpcClient,
@@ -335,16 +335,18 @@ impl PrometheusGauges {
     ) -> anyhow::Result<()> {
         // Balance of node pubkeys. Only exported if a whitelist is set!
         if !node_whitelist.0.is_empty() {
-            let balances = nodes
-                .iter()
-                .filter(|rpc| node_whitelist.contains(&rpc.pubkey))
-                .map(|rpc| {
-                    Ok((
-                        rpc.pubkey.clone(),
-                        client.get_balance(&rpc.pubkey.parse()?)?,
-                    ))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            // Fetch the whitelisted node balances concurrently rather than
+            // issuing one blocking `getBalance` round-trip per node in series.
+            let balances = futures::future::try_join_all(
+                nodes
+                    .iter()
+                    .filter(|rpc| node_whitelist.contains(&rpc.pubkey))
+                    .map(|rpc| async move {
+                        let pubkey = rpc.pubkey.parse()?;
+                        anyhow::Ok((rpc.pubkey.clone(), client.get_balance(&pubkey).await?))
+                    }),
+            )
+            .await?;
 
             for (pubkey, balance) in balances {
                 self.node_pubkey_balances

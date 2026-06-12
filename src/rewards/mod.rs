@@ -1,12 +1,12 @@
 use crate::config::Whitelist;
 use crate::rewards::caching::{PubkeyVoterApyMapping, RewardsCache};
-use crate::rpc_extra::with_first_block;
+use crate::rpc_extra::first_block_in_epoch;
 use anyhow::anyhow;
 use log::debug;
 use prometheus_exporter::prometheus::{GaugeVec, IntGaugeVec};
 use serde::{Deserialize, Serialize};
 use solana_account::Account;
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
 use solana_clock::Epoch;
 use solana_epoch_info::EpochInfo;
@@ -109,12 +109,12 @@ impl<'a> RewardsMonitor<'a> {
     }
 
     /// Exports reward metrics. APY values will not be re-calculated more than once an epoch.
-    pub fn export_rewards(&self, epoch_info: &EpochInfo) -> anyhow::Result<()> {
+    pub async fn export_rewards(&self, epoch_info: &EpochInfo) -> anyhow::Result<()> {
         let epoch = epoch_info.epoch;
 
         // Possible that rewards haven't shown up yet for this epoch
-        if self.get_rewards_for_epoch(epoch)?.is_some() {
-            let staking_apys = self.calculate_staking_rewards(epoch_info)?;
+        if self.get_rewards_for_epoch(epoch).await?.is_some() {
+            let staking_apys = self.calculate_staking_rewards(epoch_info).await?;
 
             for (
                 voter,
@@ -165,7 +165,7 @@ impl<'a> RewardsMonitor<'a> {
     }
 
     /// Calculates the staking rewards for both the current epoch and the last `MAX_EPOCH_LOOKBACK` epochs.
-    fn calculate_staking_rewards(
+    async fn calculate_staking_rewards(
         &self,
         current_epoch_info: &EpochInfo,
     ) -> anyhow::Result<HashMap<Pubkey, VoterApy>> {
@@ -175,10 +175,12 @@ impl<'a> RewardsMonitor<'a> {
             Ok(apys)
         } else {
             // Filling historical gaps
-            let (_, mut apys) = self.fill_historical_epochs(current_epoch_info)?;
+            let (_, mut apys) = self.fill_historical_epochs(current_epoch_info).await?;
 
             // Fill current epoch and find APY
-            let mapping = self.fill_current_epoch_and_find_apy(current_epoch_info, &mut apys)?;
+            let mapping = self
+                .fill_current_epoch_and_find_apy(current_epoch_info, &mut apys)
+                .await?;
 
             // Write to database
             self.cache
@@ -189,7 +191,7 @@ impl<'a> RewardsMonitor<'a> {
     }
 
     /// Fills `rewards` and `apys` with previous epochs' information, up to `MAX_EPOCH_LOOKBACK` epochs ago.
-    fn fill_historical_epochs(
+    async fn fill_historical_epochs(
         &self,
         current_epoch_info: &EpochInfo,
     ) -> anyhow::Result<(VoterEpochRewardMap, VoterEpochApyMap)> {
@@ -198,12 +200,22 @@ impl<'a> RewardsMonitor<'a> {
         let mut rewards = HashMap::new();
         let mut apys = HashMap::new();
 
-        for epoch in (current_epoch - MAX_EPOCH_LOOKBACK)..current_epoch {
-            // Historical rewards
-            let historical_rewards = self
-                .get_rewards_for_epoch(epoch)?
-                .ok_or_else(|| anyhow!("historical epoch has no rewards"))?;
-            for reward in historical_rewards {
+        // Each epoch's reward block is an independent, potentially slow `getBlock`
+        // (the epoch-boundary block carries the whole network's rewards). Fetch
+        // them concurrently rather than serially, then merge in epoch order.
+        let historical_rewards = futures::future::try_join_all(
+            ((current_epoch - MAX_EPOCH_LOOKBACK)..current_epoch).map(|epoch| async move {
+                let rewards = self
+                    .get_rewards_for_epoch(epoch)
+                    .await?
+                    .ok_or_else(|| anyhow!("historical epoch has no rewards"))?;
+                anyhow::Ok((epoch, rewards))
+            }),
+        )
+        .await?;
+
+        for (epoch, epoch_rewards) in historical_rewards {
+            for reward in epoch_rewards {
                 rewards.insert((reward.pubkey.parse()?, epoch), reward);
             }
 
@@ -221,7 +233,7 @@ impl<'a> RewardsMonitor<'a> {
 
     /// Fills `rewards` and `accounts` with the current epoch's information, either from the cache or RPC.
     /// The cache will be updated.
-    fn fill_current_epoch_and_find_apy(
+    async fn fill_current_epoch_and_find_apy(
         &self,
         current_epoch_info: &EpochInfo,
         apys: &mut VoterEpochApyMap,
@@ -229,7 +241,8 @@ impl<'a> RewardsMonitor<'a> {
         let current_epoch = current_epoch_info.epoch;
 
         let current_rewards = self
-            .get_rewards_for_epoch(current_epoch)?
+            .get_rewards_for_epoch(current_epoch)
+            .await?
             .ok_or_else(|| anyhow!("current epoch has no rewards"))?;
 
         // Extract into staking rewards and validator rewards.
@@ -280,11 +293,21 @@ impl<'a> RewardsMonitor<'a> {
             // for a given voter.
             let mut seen_voters = BTreeSet::new();
 
+            // The epoch duration is constant across every reward in this loop, so
+            // resolve it once instead of on each `calculate_staking_apy` call.
+            let epoch_duration = self
+                .epoch_duration_days(current_epoch - 1, current_epoch_info)
+                .await?
+                .unwrap_or(DEFAULT_EPOCH_LENGTH);
+
             // Chunk into 100
             for chunk in to_query.chunks(100) {
                 let pubkeys: Vec<_> = chunk.iter().map(|r| r.pubkey).collect();
                 debug!("Getting {} accounts", chunk.len());
-                let account_infos = self.client.get_multiple_accounts(pubkeys.as_slice())?;
+                let account_infos = self
+                    .client
+                    .get_multiple_accounts(pubkeys.as_slice())
+                    .await?;
 
                 // For each response in chunk
                 for (reward, account_info) in chunk
@@ -296,8 +319,7 @@ impl<'a> RewardsMonitor<'a> {
                     if let Some(StakingApy { voter, percent }) = calculate_staking_apy(
                         &account_info,
                         &mut seen_voters,
-                        self.epoch_duration_days(current_epoch - 1, current_epoch_info)?
-                            .unwrap_or(DEFAULT_EPOCH_LENGTH),
+                        epoch_duration,
                         reward.lamports as u64,
                         reward.post_balance,
                     )? {
@@ -331,15 +353,14 @@ impl<'a> RewardsMonitor<'a> {
         }
 
         // Epoch durations up to lookback
-        let epoch_durations = (current_epoch - MAX_EPOCH_LOOKBACK + 1..=current_epoch)
-            .map(|epoch| {
-                Ok((
-                    epoch,
-                    self.epoch_duration_days(epoch - 1, current_epoch_info)?
-                        .unwrap_or(DEFAULT_EPOCH_LENGTH),
-                ))
-            })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let mut epoch_durations = BTreeMap::new();
+        for epoch in current_epoch - MAX_EPOCH_LOOKBACK + 1..=current_epoch {
+            let duration = self
+                .epoch_duration_days(epoch - 1, current_epoch_info)
+                .await?
+                .unwrap_or(DEFAULT_EPOCH_LENGTH);
+            epoch_durations.insert(epoch, duration);
+        }
         let duration_max_epoch_lookback: f64 = epoch_durations.values().sum();
 
         let mut voter_apys = HashMap::new();
@@ -370,7 +391,7 @@ impl<'a> RewardsMonitor<'a> {
     /// Note that this function returns the epoch number exactly as requested. For calculating
     /// rewards, remember that the rewards for epoch `N-1` are in epoch `N`.
     /// Returns `None` if no block time is available for measurement.
-    fn epoch_duration_days(
+    async fn epoch_duration_days(
         &self,
         epoch: Epoch,
         epoch_info: &EpochInfo,
@@ -378,7 +399,9 @@ impl<'a> RewardsMonitor<'a> {
         // If it's the current epoch then we must extrapolate
         if epoch == epoch_info.epoch {
             let first_slot = epoch_info.absolute_slot - epoch_info.slot_index;
-            return if let Some(first_slot_time) = self.client.get_block(first_slot)?.block_time {
+            return if let Some(first_slot_time) =
+                self.client.get_block(first_slot).await?.block_time
+            {
                 let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
                     - first_slot_time) as f64
                     / (epoch_info.slot_index) as f64;
@@ -394,10 +417,14 @@ impl<'a> RewardsMonitor<'a> {
             Ok(Some(length))
         } else {
             debug!("Finding epoch {}", epoch);
-            let days_in_epoch = {
-                let first_block_timestamp = |ep| {
-                    with_first_block(self.client, ep, |block| {
-                        let ui_confirmed_block = self.client.get_block_with_config(
+
+            // Timestamp of the first block in `ep`, or `None` if the epoch has no
+            // first block or that block carries no block time.
+            let first_block_timestamp = |ep| async move {
+                if let Some(block) = first_block_in_epoch(self.client, ep).await? {
+                    let ui_confirmed_block = self
+                        .client
+                        .get_block_with_config(
                             block,
                             RpcBlockConfig {
                                 encoding: Some(UiTransactionEncoding::Base64),
@@ -406,23 +433,25 @@ impl<'a> RewardsMonitor<'a> {
                                 commitment: None,
                                 max_supported_transaction_version: Some(0),
                             },
-                        )?;
-                        Ok(ui_confirmed_block.block_time)
-                    })
-                };
-
-                let start_timestamp = first_block_timestamp(epoch)?;
-                let end_timestamp = first_block_timestamp(epoch + 1)?;
-
-                // Timestamps must exist for start and end block
-                if let (Some(start_timestamp), Some(end_timestamp)) =
-                    (start_timestamp, end_timestamp)
-                {
-                    (end_timestamp - start_timestamp) as f64 / SECONDS_IN_DAY as f64
+                        )
+                        .await?;
+                    anyhow::Ok(ui_confirmed_block.block_time)
                 } else {
-                    // Otherwise return early, do not update cache.
-                    return Ok(None);
+                    anyhow::Ok(None)
                 }
+            };
+
+            let start_timestamp = first_block_timestamp(epoch).await?;
+            let end_timestamp = first_block_timestamp(epoch + 1).await?;
+
+            // Timestamps must exist for start and end block
+            let days_in_epoch = if let (Some(start_timestamp), Some(end_timestamp)) =
+                (start_timestamp, end_timestamp)
+            {
+                (end_timestamp - start_timestamp) as f64 / SECONDS_IN_DAY as f64
+            } else {
+                // Otherwise return early, do not update cache.
+                return Ok(None);
             };
 
             self.cache.add_epoch_length(epoch, days_in_epoch)?;
@@ -433,15 +462,15 @@ impl<'a> RewardsMonitor<'a> {
     /// Gets the rewards for `epoch`, either from RPC or cache. The cache will be updated.
     /// Returns `Ok(None)` if there haven't been any rewards in the given epoch yet, `Ok(Some(rewards))` if there have, and
     /// otherwise returns an error.
-    fn get_rewards_for_epoch(&self, epoch: Epoch) -> anyhow::Result<Option<Rewards>> {
+    async fn get_rewards_for_epoch(&self, epoch: Epoch) -> anyhow::Result<Option<Rewards>> {
         if let Some(rewards) = self.cache.get_epoch_rewards(epoch)? {
             Ok(Some(rewards))
+        } else if let Some(block) = first_block_in_epoch(self.client, epoch).await? {
+            let rewards = self.client.get_block(block).await?.rewards;
+            self.cache.add_epoch_rewards(epoch, &rewards)?;
+            Ok(Some(rewards))
         } else {
-            with_first_block(self.client, epoch, |block| {
-                let rewards = self.client.get_block(block)?.rewards;
-                self.cache.add_epoch_rewards(epoch, &rewards)?;
-                Ok(Some(rewards))
-            })
+            Ok(None)
         }
     }
 }
