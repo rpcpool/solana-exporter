@@ -2,7 +2,7 @@ use crate::config::Whitelist;
 use anyhow::Context;
 use serde_json::Value;
 use solana_client::{
-    rpc_client::RpcClient,
+    nonblocking::rpc_client::RpcClient,
     rpc_request::RpcRequest,
     rpc_response::{RpcContactInfo, RpcVoteAccountStatus},
 };
@@ -16,9 +16,10 @@ use solana_clock::Epoch;
 /// deserialization of the *entire* response. We fetch the raw JSON and coerce
 /// any non-string, non-null `clientId` to its string form before deserializing
 /// into the typed `RpcContactInfo`.
-pub fn get_cluster_nodes_lenient(client: &RpcClient) -> anyhow::Result<Vec<RpcContactInfo>> {
+pub async fn get_cluster_nodes_lenient(client: &RpcClient) -> anyhow::Result<Vec<RpcContactInfo>> {
     let mut raw: Value = client
         .send(RpcRequest::GetClusterNodes, Value::Null)
+        .await
         .context("getClusterNodes RPC call failed")?;
 
     if let Some(nodes) = raw.as_array_mut() {
@@ -34,25 +35,16 @@ pub fn get_cluster_nodes_lenient(client: &RpcClient) -> anyhow::Result<Vec<RpcCo
     serde_json::from_value(raw).context("failed to deserialize getClusterNodes response")
 }
 
-/// Applies `f` to the first block in `epoch`.
-pub fn with_first_block<F, A>(client: &RpcClient, epoch: Epoch, f: F) -> anyhow::Result<Option<A>>
-where
-    F: Fn(u64) -> anyhow::Result<Option<A>>,
-{
-    let epoch_schedule = client.get_epoch_schedule()?;
+/// Returns the slot of the first confirmed block in `epoch`, if any.
+pub async fn first_block_in_epoch(client: &RpcClient, epoch: Epoch) -> anyhow::Result<Option<u64>> {
+    let epoch_schedule = client.get_epoch_schedule().await?;
     let first_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
 
-    // First block in `epoch`.
-    let first_block = client
-        .get_blocks_with_limit(first_slot, 1)?
+    Ok(client
+        .get_blocks_with_limit(first_slot, 1)
+        .await?
         .first()
-        .cloned();
-
-    if let Some(block) = first_block {
-        f(block)
-    } else {
-        Ok(None)
-    }
+        .cloned())
 }
 
 /// Maps vote pubkeys to node pubkeys based on the information provided in `vote_accounts`.

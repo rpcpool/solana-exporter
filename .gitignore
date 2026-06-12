@@ -1,3 +1,9 @@
 target/
 *~
 geolocation_cache.db
+# Local configs (may contain tokened RPC URLs) and test artifacts
+config.toml
+test-config*.toml
+*.db/
+dist/
+solana-exporter-linux-amd64
