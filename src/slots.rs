@@ -4,6 +4,8 @@ use crate::config::Whitelist;
 use log::debug;
 use prometheus_exporter::prometheus::{GaugeVec, IntCounterVec};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcBlockProductionConfig;
+use solana_commitment_config::CommitmentConfig;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
@@ -65,7 +67,25 @@ impl<'a> SkippedSlotsMonitor<'a> {
 
     /// Exports the skipped slot statistics for the current epoch.
     pub async fn export_skipped_slots(&mut self, node_whitelist: &Whitelist) -> anyhow::Result<()> {
-        let production = self.client.get_block_production().await?.value;
+        // Pin the query to `finalized`. With an unset commitment and `range: None`
+        // the node derives `last_slot = bank.slot()` for whichever (often
+        // unrooted, tip) bank it picks, then bound-checks that range against its
+        // own SlotHistory sysvar. On testnet that bank's slot routinely runs
+        // ahead of the newest slot in history (skipped slots, forks, snapshot
+        // restarts), so the node rejects its own computed range with
+        // "lastSlot ... is too large" / "No slot history". A finalized bank's
+        // slot is rooted and therefore present in that same bank's SlotHistory,
+        // so the self-check cannot trip. `range: None` still scopes the response
+        // to the current epoch.
+        let production = self
+            .client
+            .get_block_production_with_config(RpcBlockProductionConfig {
+                identity: None,
+                range: None,
+                commitment: Some(CommitmentConfig::finalized()),
+            })
+            .await?
+            .value;
 
         if production.range.first_slot != self.epoch_first_slot {
             // New epoch: production numbers restart from zero, so the counter

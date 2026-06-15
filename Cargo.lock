@@ -3445,6 +3445,7 @@ dependencies = [
  "solana-account",
  "solana-client",
  "solana-clock",
+ "solana-commitment-config",
  "solana-epoch-info",
  "solana-pubkey 3.0.0",
  "solana-reward-info",
