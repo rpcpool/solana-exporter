@@ -186,25 +186,45 @@ and then put real values there.",
         let _guard = exporter.wait_duration(duration);
         debug!("Updating metrics");
 
-        // Get metrics we need
-        let epoch_info = client.get_epoch_info().await?;
-        let nodes = rpc_extra::get_cluster_nodes_lenient(&client).await?;
-        let vote_accounts = client.get_vote_accounts().await?;
+        // Base data every export below depends on. If any of these fail there
+        // is nothing meaningful to publish this cycle, so log and wait for the
+        // next tick instead of propagating out of `main` — a `?` here exits the
+        // process and drops every metric until the orchestrator restarts us.
+        let base = async {
+            let epoch_info = client.get_epoch_info().await?;
+            let nodes = rpc_extra::get_cluster_nodes_lenient(&client).await?;
+            let vote_accounts = client.get_vote_accounts().await?;
+            anyhow::Ok((epoch_info, nodes, vote_accounts))
+        }
+        .await;
+        let (epoch_info, nodes, vote_accounts) = match base {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Skipping update cycle, base RPC fetch failed: {e:#}");
+                continue;
+            }
+        };
         let node_whitelist = rpc_extra::node_pubkeys(&vote_accounts_whitelist, &vote_accounts);
 
-        gauges
-            .export_vote_accounts(&vote_accounts)
-            .context("Failed to export vote account metrics")?;
-        gauges
-            .export_epoch_info(&epoch_info, &client)
-            .await
-            .context("Failed to export epoch info metrics")?;
-        gauges
+        // Each export is isolated: a transient error on one (e.g. testnet
+        // `getBlockProduction` racing the node's slot history) is logged and the
+        // remaining exports still publish, rather than one failure aborting the
+        // whole cycle or exiting the process.
+        if let Err(e) = gauges.export_vote_accounts(&vote_accounts) {
+            warn!("Failed to export vote account metrics: {e:#}");
+        }
+        if let Err(e) = gauges.export_epoch_info(&epoch_info, &client).await {
+            warn!("Failed to export epoch info metrics: {e:#}");
+        }
+        if let Err(e) = gauges
             .export_nodes_info(&nodes, &client, &node_whitelist)
-            .await?;
+            .await
+        {
+            warn!("Failed to export node info metrics: {e:#}");
+        }
         if let Some(maxmind) = config.maxmind.clone() {
             // If the MaxMind API is configured, submit queries for any uncached IPs.
-            gauges
+            if let Err(e) = gauges
                 .export_ip_addresses(
                     &nodes,
                     &vote_accounts,
@@ -213,22 +233,26 @@ and then put real values there.",
                     &node_whitelist,
                 )
                 .await
-                .context("Failed to export IP address info metrics")?;
+            {
+                warn!("Failed to export IP address info metrics: {e:#}");
+            }
         }
 
         if enable_skipped_slots {
-            skipped_slots_monitor
+            if let Err(e) = skipped_slots_monitor
                 .as_mut()
                 .unwrap()
                 .export_skipped_slots(&node_whitelist)
                 .await
-                .context("Failed to export skipped slots")?;
+            {
+                warn!("Failed to export skipped slots: {e:#}");
+            }
         }
 
         if let Some(x) = &rewards_monitor {
-            x.export_rewards(&epoch_info)
-                .await
-                .context("Failed to export rewards")?;
+            if let Err(e) = x.export_rewards(&epoch_info).await {
+                warn!("Failed to export rewards: {e:#}");
+            }
         }
     }
 }
