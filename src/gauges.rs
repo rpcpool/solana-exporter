@@ -5,6 +5,7 @@ use crate::geolocation::caching::GeolocationCache;
 use crate::geolocation::get_rpc_contact_ip;
 use crate::geolocation::identifier::DatacenterIdentifier;
 use crate::rpc_extra::first_block_in_epoch;
+use crate::rpc_extra::GossipNode;
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
 use geoip2_city::CityApiResponse;
@@ -29,6 +30,26 @@ pub const PUBKEY_LABEL: &str = "pubkey";
 pub const IDENTITY_LABEL: &str = "identity";
 /// Label used for peoch
 pub const EPOCH_LABEL: &str = "epoch";
+
+/// Extracts the bare IP from an optional `ip:port` socket address string,
+/// returning an empty string when absent. Dashboards join on bare source IPs
+/// (e.g. `xdp_proxy_src_pkts.src`), so the port must be stripped. Falls back to
+/// the substring before the last `:` for robustness; IPv6 literals advertised by
+/// gossip are bracketed (`[::1]:8001`) so the brackets are trimmed too.
+fn ip_of(socket_addr: &Option<String>) -> String {
+    match socket_addr {
+        None => String::new(),
+        Some(s) => match s.parse::<std::net::SocketAddr>() {
+            Ok(addr) => addr.ip().to_string(),
+            Err(_) => s
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(s)
+                .trim_matches(|c| c == '[' || c == ']')
+                .to_string(),
+        },
+    }
+}
 
 pub struct PrometheusGauges {
     pub active_validators: IntGaugeVec,
@@ -57,6 +78,7 @@ pub struct PrometheusGauges {
     pub node_versions: IntGaugeVec,
     pub nodes: IntGauge,
     pub average_slot_time: Gauge,
+    pub gossip_node_info: IntGaugeVec,
     // Connection pool for querying
     client: reqwest::Client,
     vote_accounts_whitelist: Whitelist,
@@ -201,6 +223,23 @@ impl PrometheusGauges {
             nodes: register_int_gauge!("solana_nodes", "Number of nodes").unwrap(),
             average_slot_time: register_gauge!("solana_average_slot_time", "Average slot time")
                 .unwrap(),
+            gossip_node_info: register_int_gauge_vec!(
+                "solana_gossip_node_info",
+                "Cluster-wide gossip info: one series per cluster node mapping its \
+                 identity/vote account to its gossip/TVU/TPU IP addresses. Value is always 1.",
+                &[
+                    IDENTITY_LABEL,
+                    // Named `vote_key` (not `vote_account`) to match the existing
+                    // validator_info{identity, vote_key} convention, so dashboards
+                    // can join our-node and network-wide metrics uniformly.
+                    "vote_key",
+                    "gossip_ip",
+                    "tvu_ip",
+                    "tpu_ip",
+                    "version",
+                ]
+            )
+            .unwrap(),
             client: reqwest::Client::new(),
             vote_accounts_whitelist,
         }
@@ -379,6 +418,56 @@ impl PrometheusGauges {
         Ok(())
     }
 
+    /// Exports cluster-wide gossip node info: one `solana_gossip_node_info`
+    /// series per node in the cluster, mapping its identity and (where it has
+    /// one) vote account to its bare gossip/TVU/TPU IP addresses.
+    ///
+    /// Unlike [`export_nodes_info`], this is **not** filtered by the whitelist —
+    /// it covers every node in `getClusterNodes` so dashboards can resolve any
+    /// source IP on the network back to a node identity. The gauge is fully
+    /// reset each cycle so series for nodes/IPs that left the cluster do not
+    /// accumulate (the cluster has thousands of nodes with IP churn).
+    pub fn export_gossip_node_info(
+        &self,
+        nodes: &[GossipNode],
+        vote_accounts: &RpcVoteAccountStatus,
+    ) -> anyhow::Result<()> {
+        // node identity pubkey -> vote account pubkey (non-voting nodes absent).
+        let vote_by_node: HashMap<&str, &str> = vote_accounts
+            .current
+            .iter()
+            .chain(vote_accounts.delinquent.iter())
+            .map(|v| (v.node_pubkey.as_str(), v.vote_pubkey.as_str()))
+            .collect();
+
+        // Reset so departed nodes / stale IPs do not linger between cycles.
+        self.gossip_node_info.reset();
+
+        for node in nodes {
+            let vote_account = vote_by_node
+                .get(node.pubkey.as_str())
+                .copied()
+                .unwrap_or("");
+            let gossip_ip = ip_of(&node.gossip);
+            let tvu_ip = ip_of(&node.tvu);
+            let tpu_ip = ip_of(&node.tpu);
+            let version = node.version.as_deref().unwrap_or("unknown");
+
+            self.gossip_node_info
+                .get_metric_with_label_values(&[
+                    &node.pubkey,
+                    vote_account,
+                    &gossip_ip,
+                    &tvu_ip,
+                    &tpu_ip,
+                    version,
+                ])
+                .map(|m| m.set(1))?;
+        }
+
+        Ok(())
+    }
+
     /// Exports gauges for geolocation of validators
     pub async fn export_ip_addresses(
         &self,
@@ -546,5 +635,32 @@ impl PrometheusGauges {
 impl Default for PrometheusGauges {
     fn default() -> Self {
         Self::new(Whitelist::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ip_of;
+
+    #[test]
+    fn ip_of_strips_port() {
+        assert_eq!(
+            ip_of(&Some("64.130.42.197:8002".to_string())),
+            "64.130.42.197"
+        );
+    }
+
+    #[test]
+    fn ip_of_handles_none_and_empty() {
+        assert_eq!(ip_of(&None), "");
+        assert_eq!(ip_of(&Some(String::new())), "");
+    }
+
+    #[test]
+    fn ip_of_strips_ipv6_brackets_and_port() {
+        assert_eq!(
+            ip_of(&Some("[2001:db8::1]:8001".to_string())),
+            "2001:db8::1"
+        );
     }
 }

@@ -30,4 +30,9 @@ pub struct ExporterConfig {
     pub enable_rewards: Option<bool>,
     /// Whjether to process skipped slots data or not
     pub enable_skipped_slots: Option<bool>,
+    /// Whether to export cluster-wide gossip node info (`solana_gossip_node_info`),
+    /// one series per cluster node. Unlike the other metrics this is NOT filtered
+    /// by the vote-account whitelist, so it adds one series per network node
+    /// (thousands). Defaults to `false`.
+    pub enable_gossip_node_info: Option<bool>,
 }

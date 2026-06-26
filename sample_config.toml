@@ -10,6 +10,10 @@ staking_account_whitelist = [
     'bb',
     'cc'
 ]
+# Export cluster-wide gossip node info (solana_gossip_node_info), one series per
+# cluster node mapping identity/vote account -> gossip/TVU/TPU IPs. NOT filtered
+# by the whitelists, so it adds one series per network node (thousands).
+enable_gossip_node_info = false
 
 [maxmind]
 username = "12345"
