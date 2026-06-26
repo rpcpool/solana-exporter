@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
             staking_account_whitelist: Some(Whitelist::default()),
             enable_rewards: Some(true),
             enable_skipped_slots: Some(true),
+            enable_gossip_node_info: Some(false),
         };
 
         let location = sc
@@ -153,6 +154,7 @@ and then put real values there.",
     let staking_account_whitelist = config.staking_account_whitelist.unwrap_or_default();
     let enable_rewards = config.enable_rewards.unwrap_or(true);
     let enable_skipped_slots = config.enable_skipped_slots.unwrap_or(true);
+    let enable_gossip_node_info = config.enable_gossip_node_info.unwrap_or(false);
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
     let mut skipped_slots_monitor = if enable_skipped_slots {
@@ -192,12 +194,17 @@ and then put real values there.",
         // process and drops every metric until the orchestrator restarts us.
         let base = async {
             let epoch_info = client.get_epoch_info().await?;
-            let nodes = rpc_extra::get_cluster_nodes_lenient(&client).await?;
+            // Fetch getClusterNodes once and derive both the typed view (used by
+            // the whitelisted exporters) and, when enabled, the raw gossip view
+            // (which preserves the `tvu` field the typed struct drops).
+            let raw_nodes = rpc_extra::get_cluster_nodes_raw(&client).await?;
+            let nodes: Vec<_> = serde_json::from_value(raw_nodes.clone())
+                .context("failed to deserialize getClusterNodes response")?;
             let vote_accounts = client.get_vote_accounts().await?;
-            anyhow::Ok((epoch_info, nodes, vote_accounts))
+            anyhow::Ok((epoch_info, raw_nodes, nodes, vote_accounts))
         }
         .await;
-        let (epoch_info, nodes, vote_accounts) = match base {
+        let (epoch_info, raw_nodes, nodes, vote_accounts) = match base {
             Ok(v) => v,
             Err(e) => {
                 warn!("Skipping update cycle, base RPC fetch failed: {e:#}");
@@ -221,6 +228,12 @@ and then put real values there.",
             .await
         {
             warn!("Failed to export node info metrics: {e:#}");
+        }
+        if enable_gossip_node_info {
+            let gossip_nodes = rpc_extra::parse_gossip_nodes(&raw_nodes);
+            if let Err(e) = gauges.export_gossip_node_info(&gossip_nodes, &vote_accounts) {
+                warn!("Failed to export gossip node info metrics: {e:#}");
+            }
         }
         if let Some(maxmind) = config.maxmind.clone() {
             // If the MaxMind API is configured, submit queries for any uncached IPs.
