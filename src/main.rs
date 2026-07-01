@@ -33,7 +33,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::{fs, time::Duration};
 
+pub mod client_id;
 pub mod config;
+pub mod enrichment;
 pub mod gauges;
 pub mod geolocation;
 pub mod persistent_database;
@@ -69,6 +71,10 @@ async fn main() -> anyhow::Result<()> {
             enable_rewards: Some(true),
             enable_skipped_slots: Some(true),
             enable_gossip_node_info: Some(false),
+            enable_validator_node_info: Some(false),
+            ip_api_base_url: Some(enrichment::DEFAULT_IP_API_BASE_URL.to_string()),
+            enable_dz_edge: Some(false),
+            dz_publisher_url: Some(enrichment::DEFAULT_DZ_PUBLISHER_URL.to_string()),
         };
 
         let location = sc
@@ -155,8 +161,31 @@ and then put real values there.",
     let enable_rewards = config.enable_rewards.unwrap_or(true);
     let enable_skipped_slots = config.enable_skipped_slots.unwrap_or(true);
     let enable_gossip_node_info = config.enable_gossip_node_info.unwrap_or(false);
+    let enable_validator_node_info = config.enable_validator_node_info.unwrap_or(false);
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
+
+    // Offloaded leader enrichment (ip-api geolocation + DZ edge). The background
+    // task keeps the sticky caches fresh so the per-cycle publish never blocks on
+    // an external API.
+    let enrichment = enrichment::Enrichment::new();
+    if enable_validator_node_info {
+        let ip_api_base_url = config
+            .ip_api_base_url
+            .clone()
+            .unwrap_or_else(|| enrichment::DEFAULT_IP_API_BASE_URL.to_string());
+        let dz_url = if config.enable_dz_edge.unwrap_or(false) {
+            Some(
+                config
+                    .dz_publisher_url
+                    .clone()
+                    .unwrap_or_else(|| enrichment::DEFAULT_DZ_PUBLISHER_URL.to_string()),
+            )
+        } else {
+            None
+        };
+        enrichment.spawn_task(ip_api_base_url, dz_url);
+    }
     let mut skipped_slots_monitor = if enable_skipped_slots {
         Some(SkippedSlotsMonitor::new(
             &client,
@@ -229,10 +258,29 @@ and then put real values there.",
         {
             warn!("Failed to export node info metrics: {e:#}");
         }
-        if enable_gossip_node_info {
+        if enable_gossip_node_info || enable_validator_node_info {
             let gossip_nodes = rpc_extra::parse_gossip_nodes(&raw_nodes);
-            if let Err(e) = gauges.export_gossip_node_info(&gossip_nodes, &vote_accounts) {
-                warn!("Failed to export gossip node info metrics: {e:#}");
+            if enable_gossip_node_info {
+                if let Err(e) = gauges.export_gossip_node_info(&gossip_nodes, &vote_accounts) {
+                    warn!("Failed to export gossip node info metrics: {e:#}");
+                }
+            }
+            if enable_validator_node_info {
+                // Feed the background enrichment task the current gossip IPs/epoch,
+                // then publish from the (last-known) sticky caches.
+                let ips = gossip_nodes
+                    .iter()
+                    .filter_map(|node| enrichment::socket_ip(&node.gossip))
+                    .collect();
+                enrichment.set_targets(ips, epoch_info.epoch);
+                if let Err(e) = gauges.export_validator_node_info(
+                    &gossip_nodes,
+                    &vote_accounts,
+                    &enrichment.geo,
+                    &enrichment.dz,
+                ) {
+                    warn!("Failed to export validator node info metrics: {e:#}");
+                }
             }
         }
         if let Some(maxmind) = config.maxmind.clone() {

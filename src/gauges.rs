@@ -1,4 +1,6 @@
+use crate::client_id::resolve_client_name;
 use crate::config::Whitelist;
+use crate::enrichment::{socket_ip, DzEdgeCache, IpGeoCache};
 use crate::geolocation::api::MaxMindAPIKey;
 use crate::geolocation::api::MAXMIND_CITY_URI;
 use crate::geolocation::caching::GeolocationCache;
@@ -79,6 +81,8 @@ pub struct PrometheusGauges {
     pub nodes: IntGauge,
     pub average_slot_time: Gauge,
     pub gossip_node_info: IntGaugeVec,
+    pub validator_node_info: IntGaugeVec,
+    pub validator_node_stake: IntGaugeVec,
     // Connection pool for querying
     client: reqwest::Client,
     vote_accounts_whitelist: Whitelist,
@@ -238,6 +242,29 @@ impl PrometheusGauges {
                     "tpu_ip",
                     "version",
                 ]
+            )
+            .unwrap(),
+            validator_node_info: register_int_gauge_vec!(
+                "solana_validator_node_info",
+                "Cluster-wide validator enrichment: one series per cluster node keyed \
+                 by identity, carrying vote account, version, client, country, ASN and \
+                 DoubleZero edge membership for dashboard joins. Value is always 1.",
+                &[
+                    IDENTITY_LABEL,
+                    "vote_key",
+                    "version",
+                    "client",
+                    "country_code",
+                    "asn",
+                    "dz_edge",
+                ]
+            )
+            .unwrap(),
+            validator_node_stake: register_int_gauge_vec!(
+                "solana_validator_node_stake",
+                "Activated stake in lamports keyed by node identity (all validators), \
+                 for joining stake onto identity-keyed metrics.",
+                &[IDENTITY_LABEL]
             )
             .unwrap(),
             client: reqwest::Client::new(),
@@ -463,6 +490,74 @@ impl PrometheusGauges {
                     version,
                 ])
                 .map(|m| m.set(1))?;
+        }
+
+        Ok(())
+    }
+
+    /// Exports the cluster-wide `solana_validator_node_info` enrichment metric
+    /// (one series per node, keyed by identity) plus `solana_validator_node_stake`
+    /// (per-identity activated stake). Geolocation and DZ edge membership are read
+    /// from the sticky caches populated out-of-band by the enrichment task, so this
+    /// never blocks on an external API. Both gauges are reset each cycle so departed
+    /// nodes do not linger.
+    pub fn export_validator_node_info(
+        &self,
+        nodes: &[GossipNode],
+        vote_accounts: &RpcVoteAccountStatus,
+        geo: &IpGeoCache,
+        dz: &DzEdgeCache,
+    ) -> anyhow::Result<()> {
+        // node identity -> (vote account, activated stake). Non-voting nodes absent.
+        let vote_by_node: HashMap<&str, (&str, u64)> = vote_accounts
+            .current
+            .iter()
+            .chain(vote_accounts.delinquent.iter())
+            .map(|v| (v.node_pubkey.as_str(), (v.vote_pubkey.as_str(), v.activated_stake)))
+            .collect();
+
+        self.validator_node_info.reset();
+        self.validator_node_stake.reset();
+
+        for node in nodes {
+            let vote_stake = vote_by_node.get(node.pubkey.as_str()).copied();
+            let (vote_account, stake) = vote_stake.unwrap_or(("", 0));
+            let version = node.version.as_deref().unwrap_or("unknown");
+            let client = resolve_client_name(node.client_id.as_deref());
+            let (country_code, asn) = socket_ip(&node.gossip)
+                .and_then(|ip| geo.get(&ip))
+                .map(|geo| {
+                    (
+                        geo.country_code.unwrap_or_else(|| "unknown".to_string()),
+                        geo.asn
+                            .map(|asn| asn.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
+                })
+                .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+            let dz_edge = match dz.is_edge(&node.pubkey) {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "unknown",
+            };
+
+            self.validator_node_info
+                .get_metric_with_label_values(&[
+                    &node.pubkey,
+                    vote_account,
+                    version,
+                    &client,
+                    &country_code,
+                    &asn,
+                    dz_edge,
+                ])
+                .map(|m| m.set(1))?;
+
+            if vote_stake.is_some() {
+                self.validator_node_stake
+                    .get_metric_with_label_values(&[&node.pubkey])
+                    .map(|m| m.set(stake as i64))?;
+            }
         }
 
         Ok(())
