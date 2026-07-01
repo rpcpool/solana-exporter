@@ -1,7 +1,7 @@
 [package]
 name = "solana-exporter"
 description = "Prometheus exporter for the Solana validator"
-version = "0.4.2"
+version = "0.5.0"
 authors = [
     "Vladimir Komendantskiy <komendantsky@gmail.com>",
     "Anson Cheung <git@anson-cheung.com>"
@@ -37,7 +37,7 @@ reqwest = { version = "^0.11.3", default-features = false, features = ["json", "
 time = { version = "^0.2.26", features = ["serde"] }
 geoip2-city = { version = "^0.1.0", features = ["serde_support"] }
 anyhow = "^1.0.40"
-tokio = "^1.6.0"
+tokio = { version = "^1.6.0", features = ["macros", "rt-multi-thread", "time"] }
 futures = "^0.3.15"
 dirs = "^3.0.2"
 semver = "^1.0.0"

@@ -25,6 +25,10 @@ pub struct GossipNode {
     pub tpu: Option<String>,
     /// Software version, if advertised.
     pub version: Option<String>,
+    /// Client id, if advertised (string name or number; see
+    /// [`get_cluster_nodes_raw`], which coerces it to a string).
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 /// Parses an already-fetched `getClusterNodes` JSON payload (as returned by
