@@ -18,6 +18,7 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
 use solana_client::rpc_response::{RpcContactInfo, RpcVoteAccountInfo, RpcVoteAccountStatus};
 use solana_epoch_info::EpochInfo;
+use solana_pubkey::Pubkey;
 use solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding};
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
@@ -75,6 +76,7 @@ pub struct PrometheusGauges {
     pub staking_commission: IntGaugeVec,
     pub validator_rewards: IntGaugeVec,
     pub node_pubkey_balances: IntGaugeVec,
+    pub vote_account_balances: IntGaugeVec,
     pub node_versions: IntGaugeVec,
     pub nodes: IntGauge,
     pub average_slot_time: Gauge,
@@ -211,6 +213,12 @@ impl PrometheusGauges {
             node_pubkey_balances: register_int_gauge_vec!(
                 "solana_node_pubkey_balances",
                 "Balance of node pubkeys",
+                &[PUBKEY_LABEL]
+            )
+            .unwrap(),
+            vote_account_balances: register_int_gauge_vec!(
+                "solana_vote_account_balances",
+                "Balance of whitelisted vote accounts in lamports",
                 &[PUBKEY_LABEL]
             )
             .unwrap(),
@@ -362,6 +370,26 @@ impl PrometheusGauges {
             self.average_slot_time.set(average_slot_time);
         }
 
+        Ok(())
+    }
+
+    /// Exports the lamport balance of each whitelisted vote account. A missing account reads as 0.
+    pub async fn export_vote_account_balances(&self, client: &RpcClient) -> anyhow::Result<()> {
+        let mut vote_pubkeys: Vec<&String> = self.vote_accounts_whitelist.0.iter().collect();
+        vote_pubkeys.sort();
+        // getMultipleAccounts accepts at most 100 keys per call.
+        for chunk in vote_pubkeys.chunks(100) {
+            let pubkeys = chunk
+                .iter()
+                .map(|p| p.parse::<Pubkey>())
+                .collect::<Result<Vec<_>, _>>()?;
+            let accounts = client.get_multiple_accounts(&pubkeys).await?;
+            for (pubkey, account) in chunk.iter().zip(accounts) {
+                self.vote_account_balances
+                    .get_metric_with_label_values(&[pubkey.as_str()])
+                    .map(|c| c.set(account.map_or(0, |a| a.lamports) as i64))?;
+            }
+        }
         Ok(())
     }
 
