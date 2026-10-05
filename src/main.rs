@@ -220,6 +220,9 @@ and then put real values there.",
         if let Err(e) = gauges.export_vote_accounts(&vote_accounts) {
             warn!("Failed to export vote account metrics: {e:#}");
         }
+        if let Err(e) = gauges.export_vote_account_balances(&client).await {
+            warn!("Failed to export vote account balance metrics: {e:#}");
+        }
         if let Err(e) = gauges.export_epoch_info(&epoch_info, &client).await {
             warn!("Failed to export epoch info metrics: {e:#}");
         }
