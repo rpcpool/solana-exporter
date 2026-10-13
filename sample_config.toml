@@ -15,6 +15,18 @@ staking_account_whitelist = [
 # by the whitelists, so it adds one series per network node (thousands).
 enable_gossip_node_info = false
 
+# Export the cluster-wide solana_validator_node_info enrichment metric
+# (identity -> vote account, version, client, country, ASN, dz_edge) plus
+# solana_validator_node_stake. Covers every cluster node (thousands) and starts
+# the ip-api geolocation background task.
+enable_validator_node_info = false
+# ip-api base URL for enrichment geolocation (free tier default).
+ip_api_base_url = "http://ip-api.com"
+# Resolve DoubleZero edge membership for the dz_edge label (adds egress to the
+# DZ publisher endpoint).
+enable_dz_edge = false
+dz_publisher_url = "https://data.malbeclabs.com/api/dz/publisher-check"
+
 [maxmind]
 username = "12345"
 password = "replace_me"
