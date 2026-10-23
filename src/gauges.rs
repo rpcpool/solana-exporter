@@ -128,7 +128,7 @@ impl PrometheusGauges {
             .unwrap(),
             vote_credits: register_int_gauge_vec!(
                 "solana_vote_credits",
-                "Vote credits per validator",
+                "Epoch credits per validator; lamports earned from the Alpenglow migration epoch on",
                 &[PUBKEY_LABEL, EPOCH_LABEL]
             )
             .unwrap(),
@@ -324,10 +324,10 @@ impl PrometheusGauges {
                 .get_metric_with_label_values(&[&*v.vote_pubkey])
                 .map(|m| m.set(v.epoch_vote_account as i64))?;
 
-            for (epoch, current_epoch_credits, _) in &v.epoch_credits {
+            for (epoch, current_epoch_credits) in epoch_credits_to_export(&v.epoch_credits) {
                 self.vote_credits
                     .get_metric_with_label_values(&[&*v.vote_pubkey, &*epoch.to_string()])
-                    .map(|m| m.set(*current_epoch_credits as i64))?;
+                    .map(|m| m.set(current_epoch_credits as i64))?;
             }
         }
 
@@ -660,6 +660,14 @@ impl PrometheusGauges {
     }
 }
 
+/// Skips the `(Epoch::MAX, u64::MAX, u64::MAX)` marker that the Alpenglow vote state migration adds.
+fn epoch_credits_to_export(entries: &[(u64, u64, u64)]) -> impl Iterator<Item = (u64, u64)> + '_ {
+    entries
+        .iter()
+        .filter(|(epoch, _, _)| *epoch != u64::MAX)
+        .map(|(epoch, credits, _)| (*epoch, *credits))
+}
+
 impl Default for PrometheusGauges {
     fn default() -> Self {
         Self::new(Whitelist::default())
@@ -668,7 +676,21 @@ impl Default for PrometheusGauges {
 
 #[cfg(test)]
 mod tests {
-    use super::ip_of;
+    use super::{epoch_credits_to_export, ip_of};
+
+    #[test]
+    fn epoch_credits_skip_alpenglow_migration_marker() {
+        let entries = [
+            (1063, 2_614_579_219, 2_607_674_107),
+            (1064, 356_923_872_864, 2_614_579_219),
+            (u64::MAX, u64::MAX, u64::MAX),
+        ];
+        let exported: Vec<_> = epoch_credits_to_export(&entries).collect();
+        assert_eq!(
+            exported,
+            vec![(1063, 2_614_579_219), (1064, 356_923_872_864)]
+        );
+    }
 
     #[test]
     fn ip_of_strips_port() {
