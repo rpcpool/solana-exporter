@@ -20,6 +20,7 @@ use solana_client::rpc_response::{RpcContactInfo, RpcVoteAccountInfo, RpcVoteAcc
 use solana_epoch_info::EpochInfo;
 use solana_pubkey::Pubkey;
 use solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding};
+use solana_vote_interface::state::VoteStateVersions;
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 
@@ -52,6 +53,30 @@ fn ip_of(socket_addr: &Option<String>) -> String {
     }
 }
 
+/// Decodes vote account data into `(role, pubkey)` pairs: the withdrawer, every
+/// scheduled voter and, from vote state V4, the two reward collectors.
+fn vote_account_authorities(data: &[u8]) -> anyhow::Result<Vec<(&'static str, String)>> {
+    let state = VoteStateVersions::deserialize(data).map_err(|e| anyhow!("{e}"))?;
+    let (withdrawer, voters, collectors) = match &state {
+        VoteStateVersions::Uninitialized => return Ok(Vec::new()),
+        VoteStateVersions::V1_14_11(s) => (&s.authorized_withdrawer, &s.authorized_voters, None),
+        VoteStateVersions::V3(s) => (&s.authorized_withdrawer, &s.authorized_voters, None),
+        VoteStateVersions::V4(s) => (
+            &s.authorized_withdrawer,
+            &s.authorized_voters,
+            Some((&s.inflation_rewards_collector, &s.block_revenue_collector)),
+        ),
+    };
+    let mut authorities = vec![("withdrawer", withdrawer.to_string())];
+    // A voter change takes effect at a later epoch, so the pending entry shows here first.
+    authorities.extend(voters.iter().map(|(_, voter)| ("voter", voter.to_string())));
+    if let Some((inflation, block)) = collectors {
+        authorities.push(("inflation_rewards_collector", inflation.to_string()));
+        authorities.push(("block_revenue_collector", block.to_string()));
+    }
+    Ok(authorities)
+}
+
 pub struct PrometheusGauges {
     pub active_validators: IntGaugeVec,
     pub is_delinquent: GaugeVec,
@@ -77,6 +102,7 @@ pub struct PrometheusGauges {
     pub validator_rewards: IntGaugeVec,
     pub node_pubkey_balances: IntGaugeVec,
     pub vote_account_balances: IntGaugeVec,
+    pub vote_account_authority: IntGaugeVec,
     pub node_versions: IntGaugeVec,
     pub nodes: IntGauge,
     pub average_slot_time: Gauge,
@@ -220,6 +246,12 @@ impl PrometheusGauges {
                 "solana_vote_account_balances",
                 "Balance of whitelisted vote accounts in lamports",
                 &[PUBKEY_LABEL]
+            )
+            .unwrap(),
+            vote_account_authority: register_int_gauge_vec!(
+                "solana_vote_account_authority",
+                "Authorities of whitelisted vote accounts. Value is always 1.",
+                &[PUBKEY_LABEL, "role", "authority"]
             )
             .unwrap(),
             node_versions: register_int_gauge_vec!(
@@ -373,10 +405,13 @@ impl PrometheusGauges {
         Ok(())
     }
 
-    /// Exports the lamport balance of each whitelisted vote account. A missing account reads as 0.
+    /// Exports the lamport balance and the authorities of each whitelisted vote account.
+    /// A missing account reads as 0 and has no authorities.
     pub async fn export_vote_account_balances(&self, client: &RpcClient) -> anyhow::Result<()> {
         let mut vote_pubkeys: Vec<&String> = self.vote_accounts_whitelist.0.iter().collect();
         vote_pubkeys.sort();
+        // Reset so a replaced authority does not linger as a second series.
+        self.vote_account_authority.reset();
         // getMultipleAccounts accepts at most 100 keys per call.
         for chunk in vote_pubkeys.chunks(100) {
             let pubkeys = chunk
@@ -387,7 +422,18 @@ impl PrometheusGauges {
             for (pubkey, account) in chunk.iter().zip(accounts) {
                 self.vote_account_balances
                     .get_metric_with_label_values(&[pubkey.as_str()])
-                    .map(|c| c.set(account.map_or(0, |a| a.lamports) as i64))?;
+                    .map(|c| c.set(account.as_ref().map_or(0, |a| a.lamports) as i64))?;
+                let Some(account) = account else { continue };
+                match vote_account_authorities(&account.data) {
+                    Ok(authorities) => {
+                        for (role, authority) in authorities {
+                            self.vote_account_authority
+                                .get_metric_with_label_values(&[pubkey.as_str(), role, &authority])
+                                .map(|c| c.set(1))?;
+                        }
+                    }
+                    Err(e) => error!("Cannot decode vote account {pubkey}: {e:#}"),
+                }
             }
         }
         Ok(())
@@ -668,7 +714,65 @@ impl Default for PrometheusGauges {
 
 #[cfg(test)]
 mod tests {
-    use super::ip_of;
+    use super::{ip_of, vote_account_authorities};
+    use solana_vote_interface::authorized_voters::AuthorizedVoters;
+    use solana_vote_interface::state::{VoteStateV3, VoteStateV4, VoteStateVersions};
+
+    const WITHDRAWER: &str = "Stake11111111111111111111111111111111111111";
+    const VOTER: &str = "Vote111111111111111111111111111111111111111";
+    const NEXT_VOTER: &str = "Config1111111111111111111111111111111111111";
+    const COLLECTOR: &str = "SysvarC1ock11111111111111111111111111111111";
+
+    fn voters() -> AuthorizedVoters {
+        let mut voters = AuthorizedVoters::new(10, VOTER.parse().unwrap());
+        voters.insert(11, NEXT_VOTER.parse().unwrap());
+        voters
+    }
+
+    #[test]
+    fn vote_account_authorities_reads_v4() {
+        let state = VoteStateV4 {
+            authorized_withdrawer: WITHDRAWER.parse().unwrap(),
+            authorized_voters: voters(),
+            inflation_rewards_collector: COLLECTOR.parse().unwrap(),
+            block_revenue_collector: VOTER.parse().unwrap(),
+            ..VoteStateV4::default()
+        };
+        let data = bincode::serialize(&VoteStateVersions::new_v4(state)).unwrap();
+        assert_eq!(
+            vote_account_authorities(&data).unwrap(),
+            vec![
+                ("withdrawer", WITHDRAWER.to_string()),
+                ("voter", VOTER.to_string()),
+                ("voter", NEXT_VOTER.to_string()),
+                ("inflation_rewards_collector", COLLECTOR.to_string()),
+                ("block_revenue_collector", VOTER.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn vote_account_authorities_reads_v3() {
+        let state = VoteStateV3 {
+            authorized_withdrawer: WITHDRAWER.parse().unwrap(),
+            authorized_voters: voters(),
+            ..VoteStateV3::default()
+        };
+        let data = bincode::serialize(&VoteStateVersions::new_v3(state)).unwrap();
+        assert_eq!(
+            vote_account_authorities(&data).unwrap(),
+            vec![
+                ("withdrawer", WITHDRAWER.to_string()),
+                ("voter", VOTER.to_string()),
+                ("voter", NEXT_VOTER.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn vote_account_authorities_rejects_other_data() {
+        assert!(vote_account_authorities(&[9, 0, 0, 0]).is_err());
+    }
 
     #[test]
     fn ip_of_strips_port() {
