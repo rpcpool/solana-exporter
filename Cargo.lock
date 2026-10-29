@@ -3451,6 +3451,7 @@ dependencies = [
  "solana-reward-info",
  "solana-stake-interface",
  "solana-transaction-status-client-types",
+ "solana-vote-interface",
  "time 0.2.27",
  "tokio",
  "toml",

@@ -45,6 +45,8 @@ toml = "^0.5.8"
 solana-transaction-status-client-types = "4.0.0"
 solana-reward-info = "5.0.0"
 solana-stake-interface = "2.0.2"
+# Same version and feature that solana-account-decoder 4.0.0 already pulls in.
+solana-vote-interface = { version = "5.1.1", features = ["bincode"] }
 
 [dependencies.console]
 version = "0.16.0"

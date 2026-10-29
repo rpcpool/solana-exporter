@@ -28,6 +28,7 @@
   - [solana_validator_rewards](exported_feeds/solana_validator_rewards.md)
   - [solana_node_pubkey_balances](exported_feeds/solana_node_pubkey_balances.md)
   - [solana_vote_account_balances](exported_feeds/solana_vote_account_balances.md)
+  - [solana_vote_account_authority](exported_feeds/solana_vote_account_authority.md)
   - [solana_node_versions](exported_feeds/solana_node_versions.md)
   - [solana_nodes](exported_feeds/solana_nodes.md)
   - [solana_average_slot_time](exported_feeds/solana_average_slot_time.md)
