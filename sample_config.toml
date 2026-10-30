@@ -14,6 +14,9 @@ staking_account_whitelist = [
 # cluster node mapping identity/vote account -> gossip/TVU/TPU IPs. NOT filtered
 # by the whitelists, so it adds one series per network node (thousands).
 enable_gossip_node_info = false
+# Export the inflation-rewards and block-revenue collectors of whitelisted vote
+# accounts (solana_vote_account_reward_destination). Needs vote account v4 on chain.
+enable_vote_account_destinations = false
 
 [maxmind]
 username = "12345"

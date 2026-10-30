@@ -35,4 +35,8 @@ pub struct ExporterConfig {
     /// by the vote-account whitelist, so it adds one series per network node
     /// (thousands). Defaults to `false`.
     pub enable_gossip_node_info: Option<bool>,
+    /// Whether to export the reward destinations of whitelisted vote accounts
+    /// (`solana_vote_account_reward_destination`). Requires a vote account layout
+    /// v4 or later on chain. Defaults to `false`.
+    pub enable_vote_account_destinations: Option<bool>,
 }

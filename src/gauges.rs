@@ -5,7 +5,7 @@ use crate::geolocation::caching::GeolocationCache;
 use crate::geolocation::get_rpc_contact_ip;
 use crate::geolocation::identifier::DatacenterIdentifier;
 use crate::rpc_extra::first_block_in_epoch;
-use crate::rpc_extra::GossipNode;
+use crate::rpc_extra::{GossipNode, RewardDestinations};
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
 use geoip2_city::CityApiResponse;
@@ -81,6 +81,7 @@ pub struct PrometheusGauges {
     pub nodes: IntGauge,
     pub average_slot_time: Gauge,
     pub gossip_node_info: IntGaugeVec,
+    pub vote_account_destination: IntGaugeVec,
     // Connection pool for querying
     client: reqwest::Client,
     vote_accounts_whitelist: Whitelist,
@@ -246,6 +247,13 @@ impl PrometheusGauges {
                     "tpu_ip",
                     "version",
                 ]
+            )
+            .unwrap(),
+            vote_account_destination: register_int_gauge_vec!(
+                "solana_vote_account_reward_destination",
+                "Reward destination of a whitelisted vote account (vote account v4): one series \
+                 per destination. Value is always 1.",
+                &[PUBKEY_LABEL, "destination", "collector"]
             )
             .unwrap(),
             client: reqwest::Client::new(),
@@ -496,6 +504,15 @@ impl PrometheusGauges {
         Ok(())
     }
 
+    /// Exports the reward destinations of vote accounts. Replaces the previous
+    /// set, so a destination that changed no longer has a series.
+    pub fn export_vote_account_destinations(
+        &self,
+        destinations: &[(Pubkey, RewardDestinations)],
+    ) -> anyhow::Result<()> {
+        set_reward_destinations(&self.vote_account_destination, destinations)
+    }
+
     /// Exports gauges for geolocation of validators
     pub async fn export_ip_addresses(
         &self,
@@ -666,9 +683,122 @@ impl Default for PrometheusGauges {
     }
 }
 
+/// Clears `gauge`, then sets one series per vote account and destination.
+fn set_reward_destinations(
+    gauge: &IntGaugeVec,
+    destinations: &[(Pubkey, RewardDestinations)],
+) -> anyhow::Result<()> {
+    gauge.reset();
+    for (vote_pubkey, found) in destinations {
+        let vote_account = vote_pubkey.to_string();
+        for (destination, collector) in [
+            ("inflation_rewards", found.inflation_rewards_collector),
+            ("block_revenue", found.block_revenue_collector),
+        ] {
+            gauge
+                .get_metric_with_label_values(&[&vote_account, destination, &collector.to_string()])
+                .map(|m| m.set(1))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ip_of;
+    use super::*;
+    use prometheus_exporter::prometheus::core::Collector;
+    use prometheus_exporter::prometheus::Opts;
+
+    fn destinations(
+        vote: &Pubkey,
+        inflation: &Pubkey,
+        block: &Pubkey,
+    ) -> Vec<(Pubkey, RewardDestinations)> {
+        vec![(
+            *vote,
+            RewardDestinations {
+                inflation_rewards_collector: *inflation,
+                block_revenue_collector: *block,
+            },
+        )]
+    }
+
+    #[test]
+    fn reward_destinations_export_one_series_per_destination() {
+        let gauge = IntGaugeVec::new(
+            Opts::new("test_reward_destination", "test"),
+            &[PUBKEY_LABEL, "destination", "collector"],
+        )
+        .unwrap();
+        let (vote, inflation, block) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+
+        set_reward_destinations(&gauge, &destinations(&vote, &inflation, &block)).unwrap();
+
+        let vote_s = vote.to_string();
+        let inflation_s = inflation.to_string();
+        let block_s = block.to_string();
+        assert_eq!(
+            gauge
+                .get_metric_with_label_values(&[&vote_s, "inflation_rewards", &inflation_s])
+                .unwrap()
+                .get(),
+            1
+        );
+        assert_eq!(
+            gauge
+                .get_metric_with_label_values(&[&vote_s, "block_revenue", &block_s])
+                .unwrap()
+                .get(),
+            1
+        );
+        assert_eq!(
+            gauge
+                .collect()
+                .iter()
+                .map(|f| f.get_metric().len())
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn reward_destinations_change_drops_the_old_series() {
+        let gauge = IntGaugeVec::new(
+            Opts::new("test_reward_destination_change", "test"),
+            &[PUBKEY_LABEL, "destination", "collector"],
+        )
+        .unwrap();
+        let (vote, old, new, block) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+
+        set_reward_destinations(&gauge, &destinations(&vote, &old, &block)).unwrap();
+        set_reward_destinations(&gauge, &destinations(&vote, &new, &block)).unwrap();
+
+        assert_eq!(
+            gauge
+                .collect()
+                .iter()
+                .map(|f| f.get_metric().len())
+                .sum::<usize>(),
+            2
+        );
+        let (vote_s, new_s) = (vote.to_string(), new.to_string());
+        assert_eq!(
+            gauge
+                .get_metric_with_label_values(&[&vote_s, "inflation_rewards", &new_s])
+                .unwrap()
+                .get(),
+            1
+        );
+    }
 
     #[test]
     fn ip_of_strips_port() {

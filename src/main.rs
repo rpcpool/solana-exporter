@@ -31,7 +31,10 @@ use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::{fs, time::Duration};
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 
 pub mod config;
 pub mod gauges;
@@ -45,6 +48,9 @@ pub mod slots;
 pub const EXPORTER_DATA_DIR: &str = ".solana-exporter";
 /// Current version of `solana-exporter`
 pub const SOLANA_EXPORTER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// How often vote account reward destinations are read. They change rarely,
+/// and reading every vote account on each one-second cycle is too heavy.
+const VOTE_DESTINATIONS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 // The metric-update guard returned by `exporter.wait_duration` is intentionally
 // held across the async MaxMind queries in the update loop, so a concurrent
@@ -69,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
             enable_rewards: Some(true),
             enable_skipped_slots: Some(true),
             enable_gossip_node_info: Some(false),
+            enable_vote_account_destinations: Some(false),
         };
 
         let location = sc
@@ -155,6 +162,8 @@ and then put real values there.",
     let enable_rewards = config.enable_rewards.unwrap_or(true);
     let enable_skipped_slots = config.enable_skipped_slots.unwrap_or(true);
     let enable_gossip_node_info = config.enable_gossip_node_info.unwrap_or(false);
+    let enable_vote_account_destinations = config.enable_vote_account_destinations.unwrap_or(false);
+    let mut destinations_refreshed_at: Option<Instant> = None;
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
     let mut skipped_slots_monitor = if enable_skipped_slots {
@@ -236,6 +245,28 @@ and then put real values there.",
             let gossip_nodes = rpc_extra::parse_gossip_nodes(&raw_nodes);
             if let Err(e) = gauges.export_gossip_node_info(&gossip_nodes, &vote_accounts) {
                 warn!("Failed to export gossip node info metrics: {e:#}");
+            }
+        }
+        if enable_vote_account_destinations
+            && destinations_refreshed_at
+                .is_none_or(|at| at.elapsed() >= VOTE_DESTINATIONS_REFRESH_INTERVAL)
+        {
+            // Set before the fetch, so a failed read waits for the next interval.
+            destinations_refreshed_at = Some(Instant::now());
+            let whitelisted: Vec<_> = vote_accounts
+                .current
+                .iter()
+                .chain(vote_accounts.delinquent.iter())
+                .filter(|v| vote_accounts_whitelist.contains(&v.vote_pubkey))
+                .filter_map(|v| v.vote_pubkey.parse().ok())
+                .collect();
+            match rpc_extra::get_reward_destinations(&client, &whitelisted).await {
+                Ok(found) => {
+                    if let Err(e) = gauges.export_vote_account_destinations(&found) {
+                        warn!("Failed to export vote account reward destinations: {e:#}");
+                    }
+                }
+                Err(e) => warn!("Failed to fetch vote account reward destinations: {e:#}"),
             }
         }
         if let Some(maxmind) = config.maxmind.clone() {
