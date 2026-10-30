@@ -1,11 +1,102 @@
 use crate::config::Whitelist;
 use anyhow::Context;
+use log::warn;
 use serde::Deserialize;
 use serde_json::Value;
 use solana_client::{
     nonblocking::rpc_client::RpcClient, rpc_request::RpcRequest, rpc_response::RpcVoteAccountStatus,
 };
 use solana_clock::Epoch;
+use solana_pubkey::Pubkey;
+use std::convert::TryInto;
+use std::str::FromStr;
+
+/// Program id that owns vote accounts.
+const VOTE_PROGRAM_ID: &str = "Vote111111111111111111111111111111111111111";
+/// Vote state version written for vote account v4. Layout from agave's
+/// `vote/src/vote_state_view/frame_v4.rs`.
+const VOTE_STATE_V4_VERSION: u32 = 3;
+/// Byte offset of `inflation_rewards_collector` in v4 vote account data.
+const INFLATION_REWARDS_COLLECTOR_OFFSET: usize = 68;
+/// Byte offset of `block_revenue_collector` in v4 vote account data.
+const BLOCK_REVENUE_COLLECTOR_OFFSET: usize = 100;
+/// Accounts per `getMultipleAccounts` call.
+const GET_MULTIPLE_ACCOUNTS_CHUNK: usize = 100;
+
+/// Reward destinations of a vote account, from vote account v4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewardDestinations {
+    /// Receives the inflation rewards.
+    pub inflation_rewards_collector: Pubkey,
+    /// Receives the block revenue.
+    pub block_revenue_collector: Pubkey,
+}
+
+/// Reads the reward destinations from raw vote account data.
+///
+/// Returns `Ok(None)` for vote states older than v4, which have no destinations.
+/// Returns an error for a version newer than v4, because its layout is unknown.
+pub fn parse_reward_destinations(data: &[u8]) -> anyhow::Result<Option<RewardDestinations>> {
+    let version_bytes: [u8; 4] = data
+        .get(..4)
+        .context("vote account data is too short for a version")?
+        .try_into()?;
+    let version = u32::from_le_bytes(version_bytes);
+    if version < VOTE_STATE_V4_VERSION {
+        return Ok(None);
+    }
+    if version > VOTE_STATE_V4_VERSION {
+        anyhow::bail!("unsupported vote state version {version}");
+    }
+
+    let pubkey_at = |offset: usize| -> anyhow::Result<Pubkey> {
+        let bytes: [u8; 32] = data
+            .get(offset..offset + 32)
+            .context("vote account data is too short for reward destinations")?
+            .try_into()?;
+        Ok(Pubkey::new_from_array(bytes))
+    };
+
+    Ok(Some(RewardDestinations {
+        inflation_rewards_collector: pubkey_at(INFLATION_REWARDS_COLLECTOR_OFFSET)?,
+        block_revenue_collector: pubkey_at(BLOCK_REVENUE_COLLECTOR_OFFSET)?,
+    }))
+}
+
+/// Fetches the reward destinations of the given vote accounts.
+///
+/// Skips accounts that do not exist, are not owned by the vote program, or have
+/// a vote state this exporter cannot read. A failed batch returns an error.
+pub async fn get_reward_destinations(
+    client: &RpcClient,
+    vote_pubkeys: &[Pubkey],
+) -> anyhow::Result<Vec<(Pubkey, RewardDestinations)>> {
+    let vote_program = Pubkey::from_str(VOTE_PROGRAM_ID)?;
+    let mut destinations = Vec::with_capacity(vote_pubkeys.len());
+
+    for chunk in vote_pubkeys.chunks(GET_MULTIPLE_ACCOUNTS_CHUNK) {
+        let accounts = client
+            .get_multiple_accounts(chunk)
+            .await
+            .context("getMultipleAccounts RPC call failed")?;
+
+        for (pubkey, account) in chunk.iter().zip(accounts) {
+            let Some(account) = account else {
+                continue;
+            };
+            if account.owner != vote_program {
+                continue;
+            }
+            match parse_reward_destinations(&account.data) {
+                Ok(Some(found)) => destinations.push((*pubkey, found)),
+                Ok(None) => {}
+                Err(e) => warn!("Skipping reward destinations of vote account {pubkey}: {e:#}"),
+            }
+        }
+    }
+
+    Ok(destinations)
+}
 
 /// A cluster node as returned by `getClusterNodes`, preserving the gossip-table
 /// address fields that the typed `RpcContactInfo` (solana-client 4.0.0) drops —
@@ -96,5 +187,54 @@ pub fn node_pubkeys(vote_pubkeys: &Whitelist, vote_accounts: &RpcVoteAccountStat
                 .map(|account| account.node_pubkey.clone())
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_vote_interface::state::{VoteStateV4, VoteStateVersions};
+
+    fn v4_data(inflation: Pubkey, block: Pubkey) -> Vec<u8> {
+        let state = VoteStateV4 {
+            inflation_rewards_collector: inflation,
+            block_revenue_collector: block,
+            ..VoteStateV4::default()
+        };
+        bincode::serialize(&VoteStateVersions::new_v4(state)).unwrap()
+    }
+
+    #[test]
+    fn parses_v4_reward_destinations_from_serialized_state() {
+        let (inflation, block) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let parsed = parse_reward_destinations(&v4_data(inflation, block)).unwrap();
+        assert_eq!(
+            parsed,
+            Some(RewardDestinations {
+                inflation_rewards_collector: inflation,
+                block_revenue_collector: block,
+            })
+        );
+    }
+
+    #[test]
+    fn skips_pre_v4_vote_state() {
+        let mut data = 2u32.to_le_bytes().to_vec();
+        data.resize(3762, 0);
+        assert_eq!(parse_reward_destinations(&data).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_unknown_newer_version() {
+        let mut data = 4u32.to_le_bytes().to_vec();
+        data.resize(3762, 0);
+        assert!(parse_reward_destinations(&data).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_v4_data() {
+        let data = v4_data(Pubkey::new_unique(), Pubkey::new_unique());
+        assert!(parse_reward_destinations(&data[..131]).is_err());
+        assert!(parse_reward_destinations(&data[..3]).is_err());
     }
 }

@@ -49,3 +49,6 @@ solana-stake-interface = "2.0.2"
 [dependencies.console]
 version = "0.16.0"
 features = ["std"]
+
+[dev-dependencies]
+solana-vote-interface = "5.1.1"
