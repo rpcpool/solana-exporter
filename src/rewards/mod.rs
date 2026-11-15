@@ -1,21 +1,18 @@
 use crate::config::Whitelist;
 use crate::rewards::caching::{PubkeyVoterApyMapping, RewardsCache};
-use crate::rpc_extra::first_block_in_epoch;
+use crate::rpc_extra::{epoch_boundary, EpochBoundaryCache};
 use anyhow::anyhow;
 use log::debug;
 use prometheus_exporter::prometheus::{GaugeVec, IntGaugeVec};
 use serde::{Deserialize, Serialize};
 use solana_account::Account;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcBlockConfig;
 use solana_clock::Epoch;
 use solana_epoch_info::EpochInfo;
 use solana_pubkey::Pubkey;
 use solana_reward_info::RewardType;
 use solana_stake_interface::state::StakeStateV2;
-use solana_transaction_status_client_types::{
-    Reward, Rewards, TransactionDetails, UiTransactionEncoding,
-};
+use solana_transaction_status_client_types::{Reward, Rewards};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use time::OffsetDateTime;
 
@@ -84,10 +81,13 @@ pub struct RewardsMonitor<'a> {
     staking_account_whitelist: &'a Whitelist,
     /// The whitelist of vote account pubkeys
     vote_accounts_whitelist: &'a Whitelist,
+    /// Shared cache for immutable epoch boundary slots and timestamps.
+    epoch_boundary_cache: &'a EpochBoundaryCache,
 }
 
 impl<'a> RewardsMonitor<'a> {
     /// Initialises a new rewards monitor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: &'a RpcClient,
         current_staking_apy: &'a GaugeVec,
@@ -96,6 +96,7 @@ impl<'a> RewardsMonitor<'a> {
         rewards_cache: &'a RewardsCache,
         staking_account_whitelist: &'a Whitelist,
         vote_accounts_whitelist: &'a Whitelist,
+        epoch_boundary_cache: &'a EpochBoundaryCache,
     ) -> Self {
         Self {
             client,
@@ -105,6 +106,7 @@ impl<'a> RewardsMonitor<'a> {
             cache: rewards_cache,
             staking_account_whitelist,
             vote_accounts_whitelist,
+            epoch_boundary_cache,
         }
     }
 
@@ -398,12 +400,11 @@ impl<'a> RewardsMonitor<'a> {
     ) -> anyhow::Result<Option<f64>> {
         // If it's the current epoch then we must extrapolate
         if epoch == epoch_info.epoch {
-            let first_slot = epoch_info.absolute_slot - epoch_info.slot_index;
-            return if let Some(first_slot_time) =
-                self.client.get_block(first_slot).await?.block_time
+            return if let Some(boundary) =
+                epoch_boundary(self.client, self.epoch_boundary_cache, epoch).await?
             {
                 let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
-                    - first_slot_time) as f64
+                    - boundary.block_time) as f64
                     / (epoch_info.slot_index) as f64;
                 Ok(Some(
                     average_slot_time * epoch_info.slots_in_epoch as f64 / SECONDS_IN_DAY as f64,
@@ -421,24 +422,11 @@ impl<'a> RewardsMonitor<'a> {
             // Timestamp of the first block in `ep`, or `None` if the epoch has no
             // first block or that block carries no block time.
             let first_block_timestamp = |ep| async move {
-                if let Some(block) = first_block_in_epoch(self.client, ep).await? {
-                    let ui_confirmed_block = self
-                        .client
-                        .get_block_with_config(
-                            block,
-                            RpcBlockConfig {
-                                encoding: Some(UiTransactionEncoding::Base64),
-                                transaction_details: Some(TransactionDetails::None),
-                                rewards: Some(false),
-                                commitment: None,
-                                max_supported_transaction_version: Some(0),
-                            },
-                        )
-                        .await?;
-                    anyhow::Ok(ui_confirmed_block.block_time)
-                } else {
-                    anyhow::Ok(None)
-                }
+                anyhow::Ok(
+                    epoch_boundary(self.client, self.epoch_boundary_cache, ep)
+                        .await?
+                        .map(|boundary| boundary.block_time),
+                )
             };
 
             let start_timestamp = first_block_timestamp(epoch).await?;
@@ -465,8 +453,10 @@ impl<'a> RewardsMonitor<'a> {
     async fn get_rewards_for_epoch(&self, epoch: Epoch) -> anyhow::Result<Option<Rewards>> {
         if let Some(rewards) = self.cache.get_epoch_rewards(epoch)? {
             Ok(Some(rewards))
-        } else if let Some(block) = first_block_in_epoch(self.client, epoch).await? {
-            let rewards = self.client.get_block(block).await?.rewards;
+        } else if let Some(boundary) =
+            epoch_boundary(self.client, self.epoch_boundary_cache, epoch).await?
+        {
+            let rewards = self.client.get_block(boundary.slot).await?.rewards;
             self.cache.add_epoch_rewards(epoch, &rewards)?;
             Ok(Some(rewards))
         } else {

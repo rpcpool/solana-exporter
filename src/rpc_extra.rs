@@ -7,9 +7,13 @@ use solana_client::{
     nonblocking::rpc_client::RpcClient, rpc_request::RpcRequest, rpc_response::RpcVoteAccountStatus,
 };
 use solana_clock::Epoch;
+use solana_epoch_schedule::EpochSchedule;
 use solana_pubkey::Pubkey;
+use std::collections::HashMap;
 use std::convert::TryInto;
+use std::future::Future;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 /// Program id that owns vote accounts.
 const VOTE_PROGRAM_ID: &str = "Vote111111111111111111111111111111111111111";
@@ -22,6 +26,56 @@ const INFLATION_REWARDS_COLLECTOR_OFFSET: usize = 68;
 const BLOCK_REVENUE_COLLECTOR_OFFSET: usize = 100;
 /// Accounts per `getMultipleAccounts` call.
 const GET_MULTIPLE_ACCOUNTS_CHUNK: usize = 100;
+
+/// Immutable information about the first confirmed block in an epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochBoundary {
+    pub slot: u64,
+    pub block_time: i64,
+}
+
+/// Process-local cache for immutable epoch boundary data.
+///
+/// Successful lookups remain valid for the lifetime of the process. Missing
+/// blocks and RPC errors are not cached because a new epoch's first confirmed
+/// block may not be available yet.
+#[derive(Default)]
+pub struct EpochBoundaryCache {
+    boundaries: Mutex<HashMap<Epoch, EpochBoundary>>,
+    epoch_schedule: Mutex<Option<EpochSchedule>>,
+}
+
+impl EpochBoundaryCache {
+    async fn get_or_try_insert_with<F, Fut>(
+        &self,
+        epoch: Epoch,
+        fetch: F,
+    ) -> anyhow::Result<Option<EpochBoundary>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Option<EpochBoundary>>>,
+    {
+        if let Some(boundary) = self.boundaries.lock().unwrap().get(&epoch).copied() {
+            return Ok(Some(boundary));
+        }
+
+        let boundary = fetch().await?;
+        if let Some(boundary) = boundary {
+            self.boundaries.lock().unwrap().insert(epoch, boundary);
+        }
+        Ok(boundary)
+    }
+
+    async fn epoch_schedule(&self, client: &RpcClient) -> anyhow::Result<EpochSchedule> {
+        if let Some(schedule) = self.epoch_schedule.lock().unwrap().clone() {
+            return Ok(schedule);
+        }
+
+        let schedule = client.get_epoch_schedule().await?;
+        *self.epoch_schedule.lock().unwrap() = Some(schedule.clone());
+        Ok(schedule)
+    }
+}
 
 /// Reward destinations of a vote account, from vote account v4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,16 +215,28 @@ pub async fn get_cluster_nodes_raw(client: &RpcClient) -> anyhow::Result<Value> 
     Ok(raw)
 }
 
-/// Returns the slot of the first confirmed block in `epoch`, if any.
-pub async fn first_block_in_epoch(client: &RpcClient, epoch: Epoch) -> anyhow::Result<Option<u64>> {
-    let epoch_schedule = client.get_epoch_schedule().await?;
-    let first_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
-
-    Ok(client
-        .get_blocks_with_limit(first_slot, 1)
-        .await?
-        .first()
-        .cloned())
+/// Returns the first confirmed block and timestamp in `epoch`, if available.
+pub async fn epoch_boundary(
+    client: &RpcClient,
+    cache: &EpochBoundaryCache,
+    epoch: Epoch,
+) -> anyhow::Result<Option<EpochBoundary>> {
+    cache
+        .get_or_try_insert_with(epoch, || async {
+            let schedule = cache.epoch_schedule(client).await?;
+            let first_slot = schedule.get_first_slot_in_epoch(epoch);
+            let Some(slot) = client
+                .get_blocks_with_limit(first_slot, 1)
+                .await?
+                .first()
+                .copied()
+            else {
+                return Ok(None);
+            };
+            let block_time = client.get_block_time(slot).await?;
+            Ok(Some(EpochBoundary { slot, block_time }))
+        })
+        .await
 }
 
 /// Maps vote pubkeys to node pubkeys based on the information provided in `vote_accounts`.
@@ -194,6 +260,7 @@ pub fn node_pubkeys(vote_pubkeys: &Whitelist, vote_accounts: &RpcVoteAccountStat
 mod tests {
     use super::*;
     use solana_vote_interface::state::{VoteStateV4, VoteStateVersions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn v4_data(inflation: Pubkey, block: Pubkey) -> Vec<u8> {
         let state = VoteStateV4 {
@@ -236,5 +303,47 @@ mod tests {
         let data = v4_data(Pubkey::new_unique(), Pubkey::new_unique());
         assert!(parse_reward_destinations(&data[..131]).is_err());
         assert!(parse_reward_destinations(&data[..3]).is_err());
+    }
+
+    #[tokio::test]
+    async fn epoch_boundary_cache_fetches_each_epoch_once() {
+        let cache = EpochBoundaryCache::default();
+        let fetches = AtomicUsize::new(0);
+        let expected = EpochBoundary {
+            slot: 432_001,
+            block_time: 1_700_000_000,
+        };
+
+        for _ in 0..2 {
+            let found = cache
+                .get_or_try_insert_with(1, || async {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(expected))
+                })
+                .await
+                .unwrap();
+            assert_eq!(found, Some(expected));
+        }
+
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn epoch_boundary_cache_retries_missing_boundaries() {
+        let cache = EpochBoundaryCache::default();
+        let fetches = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            assert!(cache
+                .get_or_try_insert_with(1, || async {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                })
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
     }
 }

@@ -3447,6 +3447,7 @@ dependencies = [
  "solana-clock",
  "solana-commitment-config",
  "solana-epoch-info",
+ "solana-epoch-schedule",
  "solana-pubkey 3.0.0",
  "solana-reward-info",
  "solana-stake-interface",

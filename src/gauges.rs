@@ -4,8 +4,7 @@ use crate::geolocation::api::MAXMIND_CITY_URI;
 use crate::geolocation::caching::GeolocationCache;
 use crate::geolocation::get_rpc_contact_ip;
 use crate::geolocation::identifier::DatacenterIdentifier;
-use crate::rpc_extra::first_block_in_epoch;
-use crate::rpc_extra::{GossipNode, RewardDestinations};
+use crate::rpc_extra::{epoch_boundary, EpochBoundaryCache, GossipNode, RewardDestinations};
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
 use geoip2_city::CityApiResponse;
@@ -15,12 +14,11 @@ use prometheus_exporter::prometheus::{
     register_int_gauge_vec, Gauge, GaugeVec, IntCounterVec, IntGauge, IntGaugeVec,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcBlockConfig;
 use solana_client::rpc_response::{RpcContactInfo, RpcVoteAccountInfo, RpcVoteAccountStatus};
 use solana_epoch_info::EpochInfo;
 use solana_pubkey::Pubkey;
-use solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding};
 use std::collections::HashMap;
+use std::time::Instant;
 use time::{Duration, OffsetDateTime};
 
 /// Label used for the status value
@@ -82,6 +80,12 @@ pub struct PrometheusGauges {
     pub average_slot_time: Gauge,
     pub gossip_node_info: IntGaugeVec,
     pub vote_account_destination: IntGaugeVec,
+    pub update_in_progress: IntGauge,
+    pub last_update_attempt_timestamp: Gauge,
+    pub last_successful_update_timestamp: Gauge,
+    pub last_update_duration: Gauge,
+    pub last_update_success: IntGauge,
+    pub update_errors: IntCounterVec,
     // Connection pool for querying
     client: reqwest::Client,
     vote_accounts_whitelist: Whitelist,
@@ -256,9 +260,62 @@ impl PrometheusGauges {
                 &[PUBKEY_LABEL, "destination", "collector"]
             )
             .unwrap(),
+            update_in_progress: register_int_gauge!(
+                "solana_exporter_update_in_progress",
+                "Whether an RPC metric update cycle is currently running"
+            )
+            .unwrap(),
+            last_update_attempt_timestamp: register_gauge!(
+                "solana_exporter_last_update_attempt_timestamp_seconds",
+                "Unix timestamp when the latest RPC metric update cycle started"
+            )
+            .unwrap(),
+            last_successful_update_timestamp: register_gauge!(
+                "solana_exporter_last_successful_update_timestamp_seconds",
+                "Unix timestamp when the latest fully successful RPC metric update cycle finished"
+            )
+            .unwrap(),
+            last_update_duration: register_gauge!(
+                "solana_exporter_last_update_duration_seconds",
+                "Duration of the latest completed RPC metric update cycle"
+            )
+            .unwrap(),
+            last_update_success: register_int_gauge!(
+                "solana_exporter_last_update_success",
+                "Whether the latest completed RPC metric update cycle fully succeeded"
+            )
+            .unwrap(),
+            update_errors: register_int_counter_vec!(
+                "solana_exporter_update_errors_total",
+                "RPC metric update errors by stage",
+                &["stage"]
+            )
+            .unwrap(),
             client: reqwest::Client::new(),
             vote_accounts_whitelist,
         }
+    }
+
+    pub fn begin_update(&self) -> Instant {
+        self.update_in_progress.set(1);
+        self.last_update_attempt_timestamp
+            .set(OffsetDateTime::now_utc().unix_timestamp() as f64);
+        Instant::now()
+    }
+
+    pub fn record_update_error(&self, stage: &str) {
+        self.update_errors.with_label_values(&[stage]).inc();
+    }
+
+    pub fn finish_update(&self, started_at: Instant, success: bool) {
+        self.last_update_duration
+            .set(started_at.elapsed().as_secs_f64());
+        self.last_update_success.set(i64::from(success));
+        if success {
+            self.last_successful_update_timestamp
+                .set(OffsetDateTime::now_utc().unix_timestamp() as f64);
+        }
+        self.update_in_progress.set(0);
     }
 
     /// Exports gauges for vote accounts
@@ -347,6 +404,7 @@ impl PrometheusGauges {
         &self,
         epoch_info: &EpochInfo,
         client: &RpcClient,
+        epoch_boundary_cache: &EpochBoundaryCache,
     ) -> anyhow::Result<()> {
         let first_slot = epoch_info.absolute_slot - epoch_info.slot_index;
         let last_slot = first_slot + epoch_info.slots_in_epoch;
@@ -358,22 +416,11 @@ impl PrometheusGauges {
         self.current_epoch_first_slot.set(first_slot as i64);
         self.current_epoch_last_slot.set(last_slot as i64);
 
-        if let Some(block) = first_block_in_epoch(client, epoch_info.epoch).await? {
+        if let Some(boundary) =
+            epoch_boundary(client, epoch_boundary_cache, epoch_info.epoch).await?
+        {
             let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
-                - client
-                    .get_block_with_config(
-                        block,
-                        RpcBlockConfig {
-                            encoding: Some(UiTransactionEncoding::Base64),
-                            transaction_details: Some(TransactionDetails::None),
-                            rewards: Some(false),
-                            commitment: None,
-                            max_supported_transaction_version: Some(0),
-                        },
-                    )
-                    .await?
-                    .block_time
-                    .unwrap()) as f64
+                - boundary.block_time) as f64
                 / (epoch_info.slot_index) as f64;
             self.average_slot_time.set(average_slot_time);
         }
