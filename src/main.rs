@@ -22,7 +22,6 @@ use crate::rewards::caching::{
     EPOCH_VOTER_APY_TREE_NAME,
 };
 use crate::rewards::RewardsMonitor;
-use crate::rpc_extra::EpochBoundaryCache;
 use crate::slots::SkippedSlotsMonitor;
 use anyhow::Context;
 use clap::{load_yaml, App};
@@ -32,6 +31,7 @@ use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::{
     fs,
     time::{Duration, Instant},
@@ -49,13 +49,42 @@ pub mod slots;
 pub const EXPORTER_DATA_DIR: &str = ".solana-exporter";
 /// Current version of `solana-exporter`
 pub const SOLANA_EXPORTER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Forms of the RPC URL that log lines must not show, because the URL can contain an access token.
+static HIDDEN_RPC_URLS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Replaces each URL in `hidden` with a placeholder.
+fn hide_urls(message: &str, hidden: &[String]) -> String {
+    hidden.iter().fold(message.to_string(), |msg, url| {
+        msg.replace(url.as_str(), "<rpc-url>")
+    })
+}
+
 /// How often vote account reward destinations are read. They change rarely,
 /// and reading every vote account on each one-second cycle is too heavy.
 const VOTE_DESTINATIONS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+// The metric-update guard returned by `exporter.wait_duration` is intentionally
+// held across the async MaxMind queries in the update loop, so a concurrent
+// `/metrics` scrape blocks until a full, consistent update is published rather
+// than observing a half-updated set. See the loop body for details.
+#[allow(clippy::await_holding_lock)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .format(|buf, record| {
+            let message = record.args().to_string();
+            let message = hide_urls(&message, HIDDEN_RPC_URLS.get().map_or(&[], Vec::as_slice));
+            writeln!(
+                buf,
+                "[{} {:<5} {}] {}",
+                buf.timestamp(),
+                record.level(),
+                record.target(),
+                message
+            )
+        })
+        .init();
     // Read from CLI arguments
     let yaml = load_yaml!("cli.yml");
     let cli_configs = App::from_yaml(yaml).get_matches();
@@ -137,12 +166,18 @@ and then put real values there.",
         toml::from_str::<ExporterConfig>(&file_contents)
     }?;
 
-    // Keep the server handle alive, but do not take its update lock: scrapes
-    // must remain responsive while an RPC call is slow or stalled.
-    let _exporter = prometheus_exporter::start(config.target)?;
-    let update_interval = config.update_interval()?;
-    // Preserve the existing RPC timeout; timeout policy is independent of the
-    // scrape and cadence changes in this update.
+    let mut hidden_rpc_urls = vec![config.rpc.clone()];
+    if let Ok(url) = reqwest::Url::parse(&config.rpc) {
+        hidden_rpc_urls.push(url.to_string());
+    }
+    let _ = HIDDEN_RPC_URLS.set(hidden_rpc_urls);
+
+    let duration = config.update_interval()?;
+    let exporter = prometheus_exporter::start(config.target)?;
+    // Interim generous ceiling: a single timeout aborts the whole update cycle
+    // and exits the process, so until per-export error isolation lands, give
+    // slow calls (e.g. epoch-boundary `getBlock` on the rewards path) room to
+    // complete rather than triggering a cold restart.
     let client = RpcClient::new_with_timeout(config.rpc.clone(), Duration::from_secs(120));
 
     let geolocation_cache =
@@ -153,7 +188,6 @@ and then put real values there.",
         persistent_database.tree(EPOCH_LENGTH_TREE_NAME)?,
         persistent_database.tree(EPOCH_VOTER_APY_TREE_NAME)?,
     );
-    let epoch_boundary_cache = EpochBoundaryCache::default();
 
     let vote_accounts_whitelist = config.vote_account_whitelist.unwrap_or_default();
     let staking_account_whitelist = config.staking_account_whitelist.unwrap_or_default();
@@ -183,20 +217,17 @@ and then put real values there.",
             &rewards_cache,
             &staking_account_whitelist,
             &vote_accounts_whitelist,
-            &epoch_boundary_cache,
         ))
     } else {
         None
     };
 
     loop {
-        // Preserve the existing delay-after-update cadence while allowing the
-        // operator to reduce RPC load. The HTTP server continues serving the
-        // latest available values throughout this sleep and the update itself.
-        tokio::time::sleep(update_interval).await;
+        // Held for the entire update cycle (including the async MaxMind queries)
+        // so a concurrent `/metrics` scrape waits for a complete, consistent
+        // update. See the `#[allow(clippy::await_holding_lock)]` on `main`.
+        let _guard = exporter.wait_duration(duration);
         debug!("Updating metrics");
-        let update_started_at = gauges.begin_update();
-        let mut update_success = true;
 
         // Base data every export below depends on. If any of these fail there
         // is nothing meaningful to publish this cycle, so log and wait for the
@@ -218,8 +249,6 @@ and then put real values there.",
             Ok(v) => v,
             Err(e) => {
                 warn!("Skipping update cycle, base RPC fetch failed: {e:#}");
-                gauges.record_update_error("base_rpc");
-                gauges.finish_update(update_started_at, false);
                 continue;
             }
         };
@@ -231,36 +260,23 @@ and then put real values there.",
         // whole cycle or exiting the process.
         if let Err(e) = gauges.export_vote_accounts(&vote_accounts) {
             warn!("Failed to export vote account metrics: {e:#}");
-            gauges.record_update_error("vote_accounts");
-            update_success = false;
         }
         if let Err(e) = gauges.export_vote_account_balances(&client).await {
             warn!("Failed to export vote account balance metrics: {e:#}");
-            gauges.record_update_error("vote_account_balances");
-            update_success = false;
         }
-        if let Err(e) = gauges
-            .export_epoch_info(&epoch_info, &client, &epoch_boundary_cache)
-            .await
-        {
+        if let Err(e) = gauges.export_epoch_info(&epoch_info, &client).await {
             warn!("Failed to export epoch info metrics: {e:#}");
-            gauges.record_update_error("epoch_info");
-            update_success = false;
         }
         if let Err(e) = gauges
             .export_nodes_info(&nodes, &client, &node_whitelist)
             .await
         {
             warn!("Failed to export node info metrics: {e:#}");
-            gauges.record_update_error("node_info");
-            update_success = false;
         }
         if enable_gossip_node_info {
             let gossip_nodes = rpc_extra::parse_gossip_nodes(&raw_nodes);
             if let Err(e) = gauges.export_gossip_node_info(&gossip_nodes, &vote_accounts) {
                 warn!("Failed to export gossip node info metrics: {e:#}");
-                gauges.record_update_error("gossip_node_info");
-                update_success = false;
             }
         }
         if enable_vote_account_destinations
@@ -280,15 +296,9 @@ and then put real values there.",
                 Ok(found) => {
                     if let Err(e) = gauges.export_vote_account_destinations(&found) {
                         warn!("Failed to export vote account reward destinations: {e:#}");
-                        gauges.record_update_error("vote_account_destinations");
-                        update_success = false;
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to fetch vote account reward destinations: {e:#}");
-                    gauges.record_update_error("vote_account_destinations");
-                    update_success = false;
-                }
+                Err(e) => warn!("Failed to fetch vote account reward destinations: {e:#}"),
             }
         }
         if let Some(maxmind) = config.maxmind.clone() {
@@ -304,8 +314,6 @@ and then put real values there.",
                 .await
             {
                 warn!("Failed to export IP address info metrics: {e:#}");
-                gauges.record_update_error("ip_addresses");
-                update_success = false;
             }
         }
 
@@ -317,19 +325,30 @@ and then put real values there.",
                 .await
             {
                 warn!("Failed to export skipped slots: {e:#}");
-                gauges.record_update_error("skipped_slots");
-                update_success = false;
             }
         }
 
         if let Some(x) = &rewards_monitor {
             if let Err(e) = x.export_rewards(&epoch_info).await {
                 warn!("Failed to export rewards: {e:#}");
-                gauges.record_update_error("rewards");
-                update_success = false;
             }
         }
+    }
+}
 
-        gauges.finish_update(update_started_at, update_success);
+#[cfg(test)]
+mod tests {
+    use super::hide_urls;
+
+    #[test]
+    fn hide_urls_removes_the_rpc_url() {
+        let hidden = vec!["https://rpc.example/secret-token".to_string()];
+        assert_eq!(
+            hide_urls(
+                "error sending request for url (https://rpc.example/secret-token)",
+                &hidden
+            ),
+            "error sending request for url (<rpc-url>)"
+        );
     }
 }

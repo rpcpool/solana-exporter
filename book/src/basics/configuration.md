@@ -22,8 +22,8 @@ password = 'password'
     - *Remark: Public nodes usually have a rate-limiting policy in place that makes usage with `solana-exporter`
       difficult (e.g., delayed response times).*
 - `target` - the target address/port to export Prometheus gauges to.
-- `update_interval_seconds` - delay between completed RPC update cycles. It defaults to `1` and must be greater than
-  zero. Increasing it reduces repeated RPC reads. Update time is not included in the delay, so cycles never overlap.
+- `update_interval_seconds` - the delay between two RPC update cycles. The default is `1`, and the value must be more
+  than zero. A larger value reduces RPC load. The delay starts after a cycle ends, so cycles never overlap.
 - `vote_account_whitelist` - an array that instructs the exporter to only export statistics related to the specified
   vote pubkeys, and their corresponding node pubkeys if found.
 - `staking_account_whitelist` - an array that instructs the exporter to only export APY statistics related to the
@@ -34,24 +34,6 @@ password = 'password'
   your account with credits.
     - `username` - the username of the API key.
     - `password` - the password of the API key.
-
-## Scrape freshness and update errors
-
-The `/metrics` endpoint remains responsive while an RPC update is running and serves the latest values available.
-Because individual metric families are updated as their RPC calls complete, a scrape during a cycle can contain values
-from both the previous and current cycle. Use these exporter metrics to evaluate freshness rather than treating every
-HTTP response as current data:
-
-- `solana_exporter_update_in_progress` is `1` while a cycle is running.
-- `solana_exporter_last_update_attempt_timestamp_seconds` records when the latest cycle started.
-- `solana_exporter_last_successful_update_timestamp_seconds` advances only after every enabled stage succeeds.
-- `solana_exporter_last_update_success` is `1` only when the latest completed cycle fully succeeded.
-- `solana_exporter_last_update_duration_seconds` records the latest completed cycle duration.
-- `solana_exporter_update_errors_total{stage}` counts errors by update stage.
-
-Epoch boundary slots and timestamps are cached in memory after a successful lookup. They are immutable, so subsequent
-average-slot-time and rewards calculations reuse them instead of repeating historical RPC reads. Missing boundaries and
-failed requests are retried on a later cycle.
 
 ## Important note on `vote_account_whitelist` and `staking_account_whitelist`
 
