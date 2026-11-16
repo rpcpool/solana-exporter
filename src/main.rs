@@ -31,6 +31,7 @@ use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::{
     fs,
     time::{Duration, Instant},
@@ -48,6 +49,17 @@ pub mod slots;
 pub const EXPORTER_DATA_DIR: &str = ".solana-exporter";
 /// Current version of `solana-exporter`
 pub const SOLANA_EXPORTER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Forms of the RPC URL that log lines must not show, because the URL can contain an access token.
+static HIDDEN_RPC_URLS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Replaces each URL in `hidden` with a placeholder.
+fn hide_urls(message: &str, hidden: &[String]) -> String {
+    hidden.iter().fold(message.to_string(), |msg, url| {
+        msg.replace(url.as_str(), "<rpc-url>")
+    })
+}
+
 /// How often vote account reward destinations are read. They change rarely,
 /// and reading every vote account on each one-second cycle is too heavy.
 const VOTE_DESTINATIONS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -59,7 +71,20 @@ const VOTE_DESTINATIONS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 #[allow(clippy::await_holding_lock)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .format(|buf, record| {
+            let message = record.args().to_string();
+            let message = hide_urls(&message, HIDDEN_RPC_URLS.get().map_or(&[], Vec::as_slice));
+            writeln!(
+                buf,
+                "[{} {:<5} {}] {}",
+                buf.timestamp(),
+                record.level(),
+                record.target(),
+                message
+            )
+        })
+        .init();
     // Read from CLI arguments
     let yaml = load_yaml!("cli.yml");
     let cli_configs = App::from_yaml(yaml).get_matches();
@@ -69,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         let template_config = ExporterConfig {
             rpc: "http://localhost:8899".to_string(),
             target: SocketAddr::new("0.0.0.0".parse()?, 9179),
+            update_interval_seconds: 1,
             maxmind: Some(MaxMindAPIKey::new("username", "password")),
             vote_account_whitelist: Some(Whitelist::default()),
             staking_account_whitelist: Some(Whitelist::default()),
@@ -140,8 +166,14 @@ and then put real values there.",
         toml::from_str::<ExporterConfig>(&file_contents)
     }?;
 
+    let mut hidden_rpc_urls = vec![config.rpc.clone()];
+    if let Ok(url) = reqwest::Url::parse(&config.rpc) {
+        hidden_rpc_urls.push(url.to_string());
+    }
+    let _ = HIDDEN_RPC_URLS.set(hidden_rpc_urls);
+
+    let duration = config.update_interval()?;
     let exporter = prometheus_exporter::start(config.target)?;
-    let duration = Duration::from_secs(1);
     // Interim generous ceiling: a single timeout aborts the whole update cycle
     // and exits the process, so until per-export error isolation lands, give
     // slow calls (e.g. epoch-boundary `getBlock` on the rewards path) room to
@@ -301,5 +333,22 @@ and then put real values there.",
                 warn!("Failed to export rewards: {e:#}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hide_urls;
+
+    #[test]
+    fn hide_urls_removes_the_rpc_url() {
+        let hidden = vec!["https://rpc.example/secret-token".to_string()];
+        assert_eq!(
+            hide_urls(
+                "error sending request for url (https://rpc.example/secret-token)",
+                &hidden
+            ),
+            "error sending request for url (<rpc-url>)"
+        );
     }
 }

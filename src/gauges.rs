@@ -15,12 +15,11 @@ use prometheus_exporter::prometheus::{
     register_int_gauge_vec, Gauge, GaugeVec, IntCounterVec, IntGauge, IntGaugeVec,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcBlockConfig;
 use solana_client::rpc_response::{RpcContactInfo, RpcVoteAccountInfo, RpcVoteAccountStatus};
 use solana_epoch_info::EpochInfo;
 use solana_pubkey::Pubkey;
-use solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use time::{Duration, OffsetDateTime};
 
 /// Label used for the status value
@@ -82,6 +81,8 @@ pub struct PrometheusGauges {
     pub average_slot_time: Gauge,
     pub gossip_node_info: IntGaugeVec,
     pub vote_account_destination: IntGaugeVec,
+    /// Epoch and block time of the first block in that epoch.
+    epoch_start_time: Mutex<Option<(u64, i64)>>,
     // Connection pool for querying
     client: reqwest::Client,
     vote_accounts_whitelist: Whitelist,
@@ -256,6 +257,7 @@ impl PrometheusGauges {
                 &[PUBKEY_LABEL, "destination", "collector"]
             )
             .unwrap(),
+            epoch_start_time: Mutex::new(None),
             client: reqwest::Client::new(),
             vote_accounts_whitelist,
         }
@@ -358,27 +360,35 @@ impl PrometheusGauges {
         self.current_epoch_first_slot.set(first_slot as i64);
         self.current_epoch_last_slot.set(last_slot as i64);
 
-        if let Some(block) = first_block_in_epoch(client, epoch_info.epoch).await? {
-            let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp()
-                - client
-                    .get_block_with_config(
-                        block,
-                        RpcBlockConfig {
-                            encoding: Some(UiTransactionEncoding::Base64),
-                            transaction_details: Some(TransactionDetails::None),
-                            rewards: Some(false),
-                            commitment: None,
-                            max_supported_transaction_version: Some(0),
-                        },
-                    )
-                    .await?
-                    .block_time
-                    .unwrap()) as f64
+        if let Some(start_time) = self.epoch_start_time(client, epoch_info.epoch).await? {
+            let average_slot_time = (OffsetDateTime::now_utc().unix_timestamp() - start_time)
+                as f64
                 / (epoch_info.slot_index) as f64;
             self.average_slot_time.set(average_slot_time);
         }
 
         Ok(())
+    }
+
+    /// Returns the block time of the first block in `epoch`. The RPC is read until one lookup per epoch succeeds.
+    async fn epoch_start_time(
+        &self,
+        client: &RpcClient,
+        epoch: u64,
+    ) -> anyhow::Result<Option<i64>> {
+        let cached = *self.epoch_start_time.lock().unwrap();
+        if let Some((cached_epoch, start_time)) = cached {
+            if cached_epoch == epoch {
+                return Ok(Some(start_time));
+            }
+        }
+        let block = match first_block_in_epoch(client, epoch).await? {
+            Some(block) => block,
+            None => return Ok(None),
+        };
+        let start_time = client.get_block_time(block).await?;
+        *self.epoch_start_time.lock().unwrap() = Some((epoch, start_time));
+        Ok(Some(start_time))
     }
 
     /// Exports the lamport balance of each whitelisted vote account. A missing account reads as 0.

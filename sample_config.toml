@@ -1,5 +1,7 @@
 rpc = 'http://localhost:8899'
 target = '0.0.0.0:9179'
+# Delay after a completed update before starting the next RPC update cycle.
+update_interval_seconds = 1
 vote_account_whitelist = [
     'a',
     'b',

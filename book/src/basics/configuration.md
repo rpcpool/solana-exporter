@@ -8,6 +8,7 @@ default directory (`~/.solana-exporter`). This page explains the individual vari
 ```toml
 rpc = 'http://localhost:8899'
 target = '0.0.0.0:9179'
+update_interval_seconds = 1
 vote_account_whitelist = []
 staking_account_whitelist = []
 
@@ -21,6 +22,8 @@ password = 'password'
     - *Remark: Public nodes usually have a rate-limiting policy in place that makes usage with `solana-exporter`
       difficult (e.g., delayed response times).*
 - `target` - the target address/port to export Prometheus gauges to.
+- `update_interval_seconds` - the delay between two RPC update cycles. The default is `1`, and the value must be more
+  than zero. A larger value reduces RPC load. The delay starts after a cycle ends, so cycles never overlap.
 - `vote_account_whitelist` - an array that instructs the exporter to only export statistics related to the specified
   vote pubkeys, and their corresponding node pubkeys if found.
 - `staking_account_whitelist` - an array that instructs the exporter to only export APY statistics related to the
