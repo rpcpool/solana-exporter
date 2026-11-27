@@ -25,7 +25,7 @@ use crate::rewards::RewardsMonitor;
 use crate::slots::SkippedSlotsMonitor;
 use anyhow::Context;
 use clap::{load_yaml, App};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
@@ -168,8 +168,6 @@ and then put real values there.",
     let _ = HIDDEN_RPC_URLS.set(hidden_rpc_urls);
 
     let duration = config.update_interval()?;
-    // `/metrics` serves the last published values and never waits for an update cycle.
-    let _exporter = prometheus_exporter::start(config.target)?;
     // Generous per-call ceiling for slow calls such as epoch-boundary `getBlock`
     // on the rewards path. A timeout fails only that export, not the cycle.
     let client = RpcClient::new_with_timeout(config.rpc.clone(), Duration::from_secs(120));
@@ -190,6 +188,8 @@ and then put real values there.",
     let enable_gossip_node_info = config.enable_gossip_node_info.unwrap_or(false);
     let enable_vote_account_destinations = config.enable_vote_account_destinations.unwrap_or(false);
     let mut destinations_refreshed_at: Option<Instant> = None;
+    // `/metrics` starts after the first complete update and then never waits for an update cycle.
+    let mut exporter = None;
 
     let gauges = PrometheusGauges::new(vote_accounts_whitelist.clone());
     let mut skipped_slots_monitor = if enable_skipped_slots {
@@ -324,6 +324,12 @@ and then put real values there.",
             if let Err(e) = x.export_rewards(&epoch_info).await {
                 warn!("Failed to export rewards: {e:#}");
             }
+        }
+
+        if exporter.is_none() {
+            // Until now every gauge is 0. A closed port makes the scraper record no sample.
+            exporter = Some(prometheus_exporter::start(config.target)?);
+            info!("Serving metrics on http://{}/metrics", config.target);
         }
     }
 }
