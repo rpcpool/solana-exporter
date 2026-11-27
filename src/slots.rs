@@ -24,13 +24,76 @@ pub struct SkippedSlotsMonitor<'a> {
     leader_slots: &'a IntCounterVec,
     /// Prometheus gauge.
     skipped_slot_percent: &'a GaugeVec,
-    /// `range.first_slot` of the last `getBlockProduction` snapshot. Identifies
-    /// the epoch the baseline below belongs to; taken from the response itself
-    /// so an epoch rollover mid-cycle cannot skew the baseline.
-    epoch_first_slot: u64,
-    /// Last observed `(leader slots, blocks produced)` per identity, used to
-    /// increment the counters by the per-cycle delta.
+    /// Turns epoch-to-date production snapshots into counter increments.
+    tracker: ProductionTracker,
+}
+
+/// Counter increments for one identity, with the epoch-to-date absolutes they came from.
+#[derive(Debug, PartialEq, Eq)]
+struct ProductionUpdate {
+    identity: String,
+    leader_slots: usize,
+    blocks_produced: usize,
+    new_validated: usize,
+    new_skipped: usize,
+}
+
+/// Converts `getBlockProduction` snapshots into per-identity increments.
+/// The first snapshot after start is a baseline and adds nothing.
+#[derive(Debug, Default)]
+struct ProductionTracker {
+    /// `range.first_slot` of the tracked epoch. `None` until the first snapshot.
+    epoch_first_slot: Option<u64>,
+    /// Highest `(leader slots, blocks produced)` seen per identity in the tracked epoch.
     last_production: HashMap<String, (usize, usize)>,
+}
+
+impl ProductionTracker {
+    /// Returns the increments since the previous snapshot, or `None` for a snapshot of an older epoch.
+    fn observe(
+        &mut self,
+        epoch_first_slot: u64,
+        by_identity: HashMap<String, (usize, usize)>,
+    ) -> Option<Vec<ProductionUpdate>> {
+        let is_baseline = match self.epoch_first_slot {
+            None => true,
+            Some(tracked) if epoch_first_slot < tracked => return None,
+            Some(tracked) if epoch_first_slot > tracked => {
+                // The epoch rolled over while running, so every slot of the new epoch is new.
+                self.last_production.clear();
+                false
+            }
+            Some(_) => false,
+        };
+        self.epoch_first_slot = Some(epoch_first_slot);
+
+        let mut updates = Vec::with_capacity(by_identity.len());
+        for (identity, (leader_slots, blocks_produced)) in by_identity {
+            // An identity missing from the last snapshot had no leader slots then.
+            let entry = self.last_production.entry(identity.clone()).or_default();
+            let (prev_leader_slots, prev_blocks_produced) = *entry;
+            // Keep the maximum, so an answer from a lagging RPC node is not counted twice.
+            *entry = (
+                leader_slots.max(prev_leader_slots),
+                blocks_produced.max(prev_blocks_produced),
+            );
+            let (new_validated, new_skipped) = if is_baseline {
+                (0, 0)
+            } else {
+                let validated = entry.1 - prev_blocks_produced;
+                let skipped = (entry.0 - prev_leader_slots).saturating_sub(validated);
+                (validated, skipped)
+            };
+            updates.push(ProductionUpdate {
+                identity,
+                leader_slots,
+                blocks_produced,
+                new_validated,
+                new_skipped,
+            });
+        }
+        Some(updates)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -60,8 +123,7 @@ impl<'a> SkippedSlotsMonitor<'a> {
             client,
             leader_slots,
             skipped_slot_percent,
-            epoch_first_slot: 0,
-            last_production: HashMap::new(),
+            tracker: ProductionTracker::default(),
         }
     }
 
@@ -87,57 +149,142 @@ impl<'a> SkippedSlotsMonitor<'a> {
             .await?
             .value;
 
-        if production.range.first_slot != self.epoch_first_slot {
-            // New epoch: production numbers restart from zero, so the counter
-            // baseline must too.
-            self.epoch_first_slot = production.range.first_slot;
-            self.last_production.clear();
+        let Some(updates) = self
+            .tracker
+            .observe(production.range.first_slot, production.by_identity)
+        else {
             debug!(
-                "SkippedSlotsMonitor reset for epoch starting at slot {}",
-                self.epoch_first_slot
+                "Ignoring getBlockProduction snapshot of an older epoch (first slot {})",
+                production.range.first_slot
             );
-        }
+            return Ok(());
+        };
 
-        let mut snapshot = HashMap::new();
         let mut feed = self.leader_slots.local();
-        for (identity, (leader_slots, blocks_produced)) in production.by_identity {
-            if !node_whitelist.contains(&identity) {
+        for update in updates {
+            if !node_whitelist.contains(&update.identity) {
                 continue;
             }
+            feed.with_label_values(&[&update.identity, &SlotStatus::Validated.to_string()])
+                .inc_by(update.new_validated as u64);
+            feed.with_label_values(&[&update.identity, &SlotStatus::Skipped.to_string()])
+                .inc_by(update.new_skipped as u64);
 
-            let (prev_leader_slots, prev_blocks_produced) = self
-                .last_production
-                .get(&identity)
-                .copied()
-                .unwrap_or_default();
-            // Saturating arithmetic absorbs the occasional regression when a
-            // load-balanced RPC pool answers consecutive calls from nodes with
-            // slightly different views of the epoch.
-            let delta_validated = blocks_produced.saturating_sub(prev_blocks_produced);
-            let delta_skipped = leader_slots
-                .saturating_sub(prev_leader_slots)
-                .saturating_sub(delta_validated);
-            feed.with_label_values(&[&identity, &SlotStatus::Validated.to_string()])
-                .inc_by(delta_validated as u64);
-            feed.with_label_values(&[&identity, &SlotStatus::Skipped.to_string()])
-                .inc_by(delta_skipped as u64);
-
-            // The percentage is set from the epoch-to-date absolutes rather
-            // than the counters, so it is exact regardless of counter resets.
-            if leader_slots > 0 {
-                let skipped = leader_slots - blocks_produced.min(leader_slots);
-                let skipped_percent = (skipped as f64 / leader_slots as f64) * 100.0;
+            // The percentage uses the epoch-to-date absolutes, so it does not depend on the counters.
+            if update.leader_slots > 0 {
+                let skipped = update.leader_slots - update.blocks_produced.min(update.leader_slots);
+                let skipped_percent = (skipped as f64 / update.leader_slots as f64) * 100.0;
                 self.skipped_slot_percent
-                    .get_metric_with_label_values(&[&identity])
+                    .get_metric_with_label_values(&[&update.identity])
                     .map(|c| c.set(skipped_percent))?;
             }
-
-            snapshot.insert(identity, (leader_slots, blocks_produced));
         }
         feed.flush();
-        self.last_production = snapshot;
 
         debug!("Exported leader slots");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProductionTracker, ProductionUpdate};
+    use std::collections::HashMap;
+
+    const EPOCH_1: u64 = 432_000;
+    const EPOCH_2: u64 = 864_000;
+
+    fn snapshot(entries: &[(&str, usize, usize)]) -> HashMap<String, (usize, usize)> {
+        entries
+            .iter()
+            .map(|(id, leader, produced)| (id.to_string(), (*leader, *produced)))
+            .collect()
+    }
+
+    /// Returns `identity -> (new validated, new skipped)`.
+    fn increments(updates: Vec<ProductionUpdate>) -> HashMap<String, (usize, usize)> {
+        updates
+            .into_iter()
+            .map(|u| (u.identity, (u.new_validated, u.new_skipped)))
+            .collect()
+    }
+
+    #[test]
+    fn first_snapshot_is_a_baseline() {
+        let mut tracker = ProductionTracker::default();
+        let updates = tracker
+            .observe(EPOCH_1, snapshot(&[("a", 26_000, 25_900), ("b", 40, 40)]))
+            .unwrap();
+        let a = updates.iter().find(|u| u.identity == "a").unwrap();
+        assert_eq!((a.leader_slots, a.blocks_produced), (26_000, 25_900));
+        assert_eq!(increments(updates), snapshot(&[("a", 0, 0), ("b", 0, 0)]));
+    }
+
+    #[test]
+    fn second_snapshot_counts_only_the_delta() {
+        let mut tracker = ProductionTracker::default();
+        tracker.observe(EPOCH_1, snapshot(&[("a", 100, 90)]));
+        let updates = tracker
+            .observe(EPOCH_1, snapshot(&[("a", 108, 96)]))
+            .unwrap();
+        // 8 new leader slots: 6 produced, 2 skipped.
+        assert_eq!(increments(updates), snapshot(&[("a", 6, 2)]));
+    }
+
+    #[test]
+    fn identity_first_seen_after_the_baseline_counts_from_zero() {
+        let mut tracker = ProductionTracker::default();
+        tracker.observe(EPOCH_1, snapshot(&[("a", 100, 90)]));
+        let updates = tracker
+            .observe(EPOCH_1, snapshot(&[("a", 100, 90), ("b", 4, 3)]))
+            .unwrap();
+        assert_eq!(increments(updates), snapshot(&[("a", 0, 0), ("b", 3, 1)]));
+    }
+
+    #[test]
+    fn lagging_snapshot_is_not_counted_twice() {
+        let mut tracker = ProductionTracker::default();
+        tracker.observe(EPOCH_1, snapshot(&[("a", 100, 90)]));
+        let lagging = tracker
+            .observe(EPOCH_1, snapshot(&[("a", 96, 87)]))
+            .unwrap();
+        assert_eq!(increments(lagging), snapshot(&[("a", 0, 0)]));
+        let caught_up = tracker
+            .observe(EPOCH_1, snapshot(&[("a", 104, 94)]))
+            .unwrap();
+        assert_eq!(increments(caught_up), snapshot(&[("a", 4, 0)]));
+    }
+
+    #[test]
+    fn epoch_rollover_counts_the_new_epoch_from_zero() {
+        let mut tracker = ProductionTracker::default();
+        tracker.observe(EPOCH_1, snapshot(&[("a", 26_000, 25_900)]));
+        let updates = tracker.observe(EPOCH_2, snapshot(&[("a", 8, 7)])).unwrap();
+        assert_eq!(increments(updates), snapshot(&[("a", 7, 1)]));
+        let next = tracker
+            .observe(EPOCH_2, snapshot(&[("a", 12, 11)]))
+            .unwrap();
+        assert_eq!(increments(next), snapshot(&[("a", 4, 0)]));
+    }
+
+    #[test]
+    fn snapshot_of_an_older_epoch_is_ignored() {
+        let mut tracker = ProductionTracker::default();
+        tracker.observe(EPOCH_1, snapshot(&[("a", 26_000, 25_900)]));
+        tracker.observe(EPOCH_2, snapshot(&[("a", 8, 7)]));
+        assert!(tracker
+            .observe(EPOCH_1, snapshot(&[("a", 26_004, 25_904)]))
+            .is_none());
+        let updates = tracker
+            .observe(EPOCH_2, snapshot(&[("a", 12, 11)]))
+            .unwrap();
+        assert_eq!(increments(updates), snapshot(&[("a", 4, 0)]));
+    }
+
+    #[test]
+    fn rollover_before_the_first_snapshot_is_still_a_baseline() {
+        let mut tracker = ProductionTracker::default();
+        let updates = tracker.observe(EPOCH_2, snapshot(&[("a", 8, 7)])).unwrap();
+        assert_eq!(increments(updates), snapshot(&[("a", 0, 0)]));
     }
 }
