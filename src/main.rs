@@ -64,11 +64,6 @@ fn hide_urls(message: &str, hidden: &[String]) -> String {
 /// and reading every vote account on each one-second cycle is too heavy.
 const VOTE_DESTINATIONS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-// The metric-update guard returned by `exporter.wait_duration` is intentionally
-// held across the async MaxMind queries in the update loop, so a concurrent
-// `/metrics` scrape blocks until a full, consistent update is published rather
-// than observing a half-updated set. See the loop body for details.
-#[allow(clippy::await_holding_lock)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_default_env()
@@ -173,11 +168,10 @@ and then put real values there.",
     let _ = HIDDEN_RPC_URLS.set(hidden_rpc_urls);
 
     let duration = config.update_interval()?;
-    let exporter = prometheus_exporter::start(config.target)?;
-    // Interim generous ceiling: a single timeout aborts the whole update cycle
-    // and exits the process, so until per-export error isolation lands, give
-    // slow calls (e.g. epoch-boundary `getBlock` on the rewards path) room to
-    // complete rather than triggering a cold restart.
+    // `/metrics` serves the last published values and never waits for an update cycle.
+    let _exporter = prometheus_exporter::start(config.target)?;
+    // Generous per-call ceiling for slow calls such as epoch-boundary `getBlock`
+    // on the rewards path. A timeout fails only that export, not the cycle.
     let client = RpcClient::new_with_timeout(config.rpc.clone(), Duration::from_secs(120));
 
     let geolocation_cache =
@@ -223,10 +217,8 @@ and then put real values there.",
     };
 
     loop {
-        // Held for the entire update cycle (including the async MaxMind queries)
-        // so a concurrent `/metrics` scrape waits for a complete, consistent
-        // update. See the `#[allow(clippy::await_holding_lock)]` on `main`.
-        let _guard = exporter.wait_duration(duration);
+        // No metrics lock is held across RPC calls, so a slow node cannot block scrapes.
+        tokio::time::sleep(duration).await;
         debug!("Updating metrics");
 
         // Base data every export below depends on. If any of these fail there
